@@ -1,118 +1,384 @@
-# Anime_clips
+# Anime Clips Generator
 
-Generate “important” clips from a video by:
-- transcribing audio to an SRT
-- scoring candidate highlight windows
-- exporting clips (optionally with aspect crop/pad + target resolution)
+Automatically generate engaging short-form video clips from anime (or any video) by intelligently selecting and formatting key moments. Perfect for creating YouTube Shorts, TikTok, or Instagram Reels content.
 
-This repo is Windows-first (paths are currently hardcoded in `auto_important_clips.py`).
+## 📋 Features
 
-## Setup
+### Core Functionality
+- **Intelligent Clip Selection**: Transcribes video audio, analyzes subtitles, and scores candidate clips based on engagement potential (questions, exclamations, dialogue intensity)
+- **Smart Video Processing**: Scales to target resolution (e.g., 1080x1920), applies aspect fitting/filling/cropping
+- **Multi-threaded Export**: Parallel FFmpeg processing optimized for RTX 3060 and other GPUs
+- **Anime-Specific Template**: Auto-detects anime content and applies contextual emoji overlays (⚔️ 🔥 😳 🤯 for relevant scenes)
+- **Configurable Overlays**: Top/bottom text bars with gradient support, ASS subtitle styling, colored CTAs (Subscribe/Like/Channel)
+- **Language Detection**: Auto-detects Japanese vs. English audio for optimal processing
 
-Create/activate your venv, then install deps:
+### Recent Improvements (December 2025)
+- ✅ **Varied emoji support** for anime clips (not just ⭐; context-aware based on text keywords)
+- ✅ **Colored CTA overlays** (Subscribe/Like keywords use accent colors via ASS tags)
+- ✅ **No truncation on overlays** (bottom text preserved in full, never shortened to "Subsc...")
+- ✅ **Proper ASS subtitle handling** (respects override tags, wraps correctly)
+- ✅ **Each clip is independent** (target-length = length per clip, NOT total duration)
 
-```powershell
-# From repo root
+---
+
+## 🚀 Quick Start
+
+### 1. Install Dependencies
+
+```bash
+# Create virtual environment
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
+
+# Install packages
 pip install -r requirements.txt
 ```
 
-## GPU transcription (RTX 3060 / CUDA)
+### 2. Basic Usage
 
-For fastest transcription, use **faster-whisper** on CUDA.
-
-Recommended settings:
-- `--asr-backend faster-whisper`
-- `--asr-device cuda`
-- `--asr-compute-type float16`
-- `--asr-model small` (good speed/quality)
-
-Example:
-
-```powershell
-python auto_important_clips.py --video "C:\path\video.mkv" --num-clips 5 --outdir out_clips --workdir work \
-  --asr-backend faster-whisper --asr-device cuda --asr-compute-type float16 --asr-model small
+```bash
+# Generate 5 clips of 3 minutes each from anime video
+python auto_important_clips.py \
+  --video "path/to/Naruto_030.mp4" \
+  --outdir "output/clips" \
+  --num-clips 5 \
+  --target-length 180 \
+  --template-style anime \
+  --aspect-mode fit \
+  --target-res 1080x1920 \
+  --channel-name "@MyChannel"
 ```
 
-Notes:
-- The first run downloads the model; later runs reuse it.
-- Transcripts are cached to `work/<video>.srt` with config metadata in `work/<video>.asr.json`.
+### 3. Launch UI (Recommended)
 
-## Parallel processing (stable defaults)
-
-- Clip exporting uses parallel workers via `--jobs`.
-- When NVENC is used, the script caps parallel exports to **3** to avoid GPU contention.
-
-## Cropping / aspect / target resolution
-
-- `--aspect source` preserves the original frame (no crop/pad)
-- `--aspect-mode fit` pads to the requested aspect (no cropping)
-- `--aspect-mode fill` crops center to the requested aspect
-- `--aspect-mode smart` chooses `fill` for action-heavy clips and `fit` for calmer clips
-- `--target-res WxH` (e.g. `1080x1920`) scales the final output to exactly that size
-
-Example vertical 9:16 @ 1080x1920:
-
-```powershell
-python auto_important_clips.py --video "C:\path\video.mkv" --num-clips 5 --outdir out_clips --workdir work \
-  --aspect 9:16 --aspect-mode smart --target-res 1080x1920
-```
-
-## Quick self-test
-
-```powershell
-python self_test.py
-```
-
-Optional end-to-end test:
-
-```powershell
-python self_test.py --video "C:\path\video.mkv"
-```
-
-## UI
-
-Run:
-
-```powershell
+```bash
 python clip_generator_ui.py
 ```
 
-## Portable setup (no hard-coded paths)
+---
 
-`auto_important_clips.py` now discovers tools at runtime.
+## 🎯 Key Command-Line Arguments
 
-### ffmpeg / ffprobe
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--video` | str | **Required** | Path to input video file |
+| `--outdir` | str | **Required** | Output directory for clips |
+| `--num-clips` | int | 5 | Number of clips to generate |
+| `--target-length` | int | 180 (sec) | **Length per clip** (NOT total) |
+| `--template-style` | str | viral_shorts | Overlay style: `simple`, `viral_shorts`, `anime`, `neon_vibes`, `cinematic` |
+| `--aspect-mode` | str | fit | `fit` (pad), `fill` (crop) |
+| `--target-res` | str | 1080x1920 | Output resolution (e.g., `1080x1920` for vertical) |
+| `--channel-name` | str | "" | Your channel name (for CTA: "Subscribe @YourChannel") |
+| `--language` | str | auto | `auto`, `english`, `japanese` |
+| `--hook-seed` | int | 0 | Seed for deterministic emoji selection (increment to vary) |
+| `--encoder` | str | auto | `auto`, `libx264`, `h264_nvenc` |
+| `--jobs` | int | 2 | Parallel export workers |
+| `--overlay-top-text` | str | {hook} | Template for top text (supports {hook}, {punchline}, {primary}, {channel}) |
+| `--overlay-bottom-text` | str | {punchline} | Template for bottom text |
 
-Preferred:
-- Install ffmpeg and ensure `ffmpeg` and `ffprobe` are available on `PATH`.
+---
 
-Or set explicit paths (recommended for CI / portability):
+## 🎨 Overlay Templates
 
-```powershell
-$env:ANIMECLIPS_FFMPEG  = "C:\\path\\to\\ffmpeg.exe"
-$env:ANIMECLIPS_FFPROBE = "C:\\path\\to\\ffprobe.exe"
+### Available Templates
+
+| Name | Style | Best For |
+|------|-------|----------|
+| `simple` | Minimal shadow text | Clean, minimal look |
+| `viral_shorts` | Gradient blue with emojis | High-energy shorts |
+| `anime` | Solid blue bars + varied emojis | Anime clips with context emojis |
+| `neon_vibes` | Neon pink/purple gradient | Trendy, eye-catching |
+| `cinematic` | Dark subtle bars | Professional/cinematic |
+| `glass_modern` | Transparent modern look | Modern aesthetic |
+
+### Example: Using Anime Template
+
+```bash
+python auto_important_clips.py \
+  --video "anime.mkv" \
+  --num-clips 5 \
+  --target-length 180 \
+  --template-style anime \
+  --channel-name "@MyAnimeChannel" \
+  --hook-seed 42  # Deterministic emoji selection
 ```
 
-### whisper.cpp (optional)
+The `anime` template will:
+- Detect content type and use blue overlay bars
+- Pick **context-aware emojis** based on clip text
+  - `⚔️ 🔥 💥 ⚡` for fight scenes
+  - `🤯 😳 😱` for shock moments
+  - `😂 🤣 💀` for funny scenes
+  - `🥺 😢 💔` for sad scenes
+  - etc.
+- Color Subscribe/Like CTAs for visibility (accent color for keyword, white for channel)
+- Wrap text intelligently to prevent overflow
 
-Only needed if you choose `--asr-backend whispercpp`.
+---
 
-```powershell
-$env:ANIMECLIPS_WHISPER_CLI       = "C:\\path\\to\\whisper-cli.exe"
-$env:ANIMECLIPS_WHISPER_MODEL     = "C:\\path\\to\\ggml-medium.bin"
-$env:ANIMECLIPS_WHISPER_VAD_MODEL = "C:\\path\\to\\ggml-silero-v5.1.2.bin"
+## 💾 Project Structure
+
+```
+Anime_clips/
+├── auto_important_clips.py       # Core clip generation engine (~1600 lines)
+├── clip_generator_ui.py          # GUI interface (Tkinter-based)
+├── check_cuda.py                 # CUDA diagnostics
+├── asr_diagnose.py               # ASR (audio transcription) diagnostics
+├── self_test.py                  # Self-test suite
+├── requirements.txt              # Python dependencies
+├── README.md                      # Original readme
+├── README_NEW.md                  # This file (comprehensive)
+├── FUTURE_IMPROVEMENTS.md        # Planned enhancements
+└── output/                       # Generated clips & transcripts
+    └── <VideoName>/
+        ├── *_clip_01_*.mp4
+        ├── *_clip_02_*.mp4
+        ├── *_transcript.srt
+        └── *_summary.txt
 ```
 
-If you don’t set these, just use `--asr-backend faster-whisper`.
+---
 
-### GPU ASR (Windows)
+## 📊 How Clip Duration Works
 
-GPU ASR requires cuDNN DLLs to be discoverable on PATH. If CUDA init fails, the app will automatically fall back to CPU.
+**IMPORTANT**: `--target-length` specifies the length of **each individual clip**, NOT the total.
 
-Run diagnostics:
+Examples:
 
-```powershell
+```bash
+# Generate 5 clips, each 3 minutes long (15 minutes total)
+--num-clips 5 --target-length 180
+
+# Generate 10 clips, each 60 seconds long (10 minutes total)
+--num-clips 10 --target-length 60
+
+# Generate 20 clips, each 15 seconds long (5 minutes total) [TikTok-friendly]
+--num-clips 20 --target-length 15
+```
+
+---
+
+## 🔧 Configuration
+
+### FFmpeg Path
+If FFmpeg is not on PATH:
+```bash
+# Set environment variable (PowerShell)
+$env:FFMPEG = "C:\path\to\ffmpeg.exe"
+```
+
+### GPU Selection
+- **NVIDIA (CUDA)**: Automatically detects and uses `h264_nvenc` if available
+- **CPU**: Falls back to `libx264` (slower but works anywhere)
+- **Force specific encoder**: `--encoder libx264` or `--encoder h264_nvenc`
+
+### Parallel Jobs
+For RTX 3060 with NVENC:
+```bash
+--jobs 3  # Cap at 3 to avoid GPU memory contention
+```
+
+For CPU:
+```bash
+--jobs 4  # Use 4 CPU workers
+```
+
+---
+
+## 📊 Output
+
+After processing, you'll find in `output/<VideoName>/`:
+
+| File | Purpose |
+|------|---------|
+| `*_clip_01_*.mp4` | Exported clip #1 (H.264 video, AAC audio) |
+| `*_clip_02_*.mp4` | Exported clip #2 |
+| `*_transcript.srt` | Full video transcript (SRT format) |
+| `*_summary.txt` | Metadata: clip count, duration, hooks, punchlines |
+
+Example summary:
+```
+Video: Naruto_030 - The Sharingan Revived.mkv
+Processed: 2025-12-28 14:32:01
+Model: small
+Language: english
+Resolution: 1080x1920
+Aspect Mode: fit
+Requested Clips: 5
+Generated Clips: 5
+Clip Length (per clip): 180s
+Total Duration: 900.0 seconds (15.0 minutes)
+
+Clips:
+Clip 1:
+  Time: 00:00:15.000 --> 00:03:15.000 (180.0s)
+  Hook: Wait for it…
+  Punchline: This changes everything...
+  Full text: [transcript excerpt]
+```
+
+---
+
+## 🐛 Troubleshooting
+
+### No clips exported
+- Check `work/log_*.txt` files for FFmpeg errors
+- Ensure FFmpeg is installed and on PATH
+- Verify input video is accessible and valid codec
+- Run `python check_cuda.py` to diagnose GPU issues
+
+### Emojis not displaying
+- **Use `--template-style anime`** (other templates may have limited emoji support)
+- Check that output clips play in a player that supports emoji rendering
+- Verify Arial font is installed (default emoji-aware font on Windows)
+
+### Slow processing
+- Use GPU encoding: `--encoder h264_nvenc` (NVIDIA RTX series)
+- Reduce `--target-res` (e.g., `720x1280` instead of `1080x1920`)
+- Increase `--jobs` (but cap at 3-4 for NVENC to avoid memory overflow)
+- Use smaller Whisper model: `--whisper-model base`
+
+### Audio language not detected
+- Manually set: `--language english` or `--language japanese`
+- Run `python asr_diagnose.py` to debug ASR issues
+
+### Overlay text truncated or corrupted
+- This was fixed in December 2025; if you see "Subsc..." instead of "Subscribe @Channel", rebuild ASS files
+- Try regenerating clips with latest code
+- Check `work/overlay_*.ass` files for ASS syntax
+
+---
+
+## 📝 Examples
+
+### Example 1: Quick TikTok Clips (15 seconds each)
+```bash
+python auto_important_clips.py \
+  --video "episode.mkv" \
+  --outdir "clips_tiktok" \
+  --num-clips 10 \
+  --target-length 15 \
+  --template-style viral_shorts \
+  --target-res 1080x1920 \
+  --channel-name "@MyAnimeChannel"
+```
+
+**Result**: 10 clips × 15 sec = 150 sec total
+
+### Example 2: YouTube Shorts (60 seconds each)
+```bash
+python auto_important_clips.py \
+  --video "episode.mkv" \
+  --outdir "clips_youtube" \
+  --num-clips 8 \
+  --target-length 60 \
+  --template-style anime \
+  --target-res 1080x1920 \
+  --channel-name "@MyChannel" \
+  --hook-seed 99
+```
+
+**Result**: 8 clips × 60 sec = 480 sec total
+
+### Example 3: Professional Cinematic (2 minutes each)
+```bash
+python auto_important_clips.py \
+  --video "movie.mkv" \
+  --outdir "professional_clips" \
+  --num-clips 5 \
+  --target-length 120 \
+  --template-style cinematic \
+  --aspect-mode fill \
+  --target-res 1920x1080 \
+  --encoder h264_nvenc
+```
+
+**Result**: 5 clips × 120 sec = 600 sec total
+
+### Example 4: Long-Form Commentary (3 minutes each)
+```bash
+python auto_important_clips.py \
+  --video "interview.mkv" \
+  --outdir "commentary_clips" \
+  --num-clips 5 \
+  --target-length 180 \
+  --template-style glass_modern \
+  --channel-name "@Commentary" \
+  --jobs 3
+```
+
+**Result**: 5 clips × 180 sec = 900 sec total
+
+---
+
+## 🔬 Testing
+
+Run self-tests:
+```bash
+python self_test.py
+python check_cuda.py
 python asr_diagnose.py
 ```
+
+---
+
+## 🏗️ Architecture Overview
+
+### Processing Pipeline
+
+1. **Input Validation** → Check video exists and is accessible
+2. **Language Detection** → Sample audio to identify Japanese vs. English
+3. **Transcription** → Extract audio, transcribe to SRT using Whisper (small model by default)
+4. **Candidate Generation** → Parse SRT, merge adjacent subtitles into clip-sized chunks
+5. **Clip Scoring** → Heuristic scoring based on:
+   - Keywords (fight, secret, surprise, funny, etc.)
+   - Punctuation (questions, exclamations)
+   - Clip duration match to target
+   - Position in video (avoid intro/outro)
+6. **Clip Selection** → Select top N clips while avoiding temporal overlap
+7. **Filter Chain Building** → Generate FFmpeg complex filter for each clip:
+   - Scaling & aspect ratio handling
+   - Background blur (fit mode)
+   - Colored bars (top/bottom)
+   - ASS subtitle overlay (with emoji + colored CTA)
+8. **Parallel Export** → Multi-threaded FFmpeg encoding with GPU acceleration
+9. **Cleanup** → Remove temp files, generate summary report
+
+### Key Classes & Functions
+
+**Data Structures**:
+- **`OverlayTemplate`**: Dataclass defining visual style (colors, text, emojis, opacity, ASS colors)
+- **`Candidate`**: Dataclass for clip metadata (start, end, text, score)
+
+**Core Functions**:
+- **`build_filter_chain()`**: Constructs FFmpeg complex filter for single clip (1200+ lines)
+- **`_pick_top_emojis_for_text()`**: Context-aware emoji selection based on clip content keywords
+- **`_style_bottom_text_ass()`**: ASS coloring for Subscribe/Like CTAs (preserves full text)
+- **`_wrap_for_ass()`**: Smart wrapping for ASS subtitles (handles override tags)
+- **`compute_heuristic_score()`**: Scores clips based on engagement signals
+- **`main()`**: CLI entry point with argparse + orchestration
+
+---
+
+## 🚦 Current Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Core clip generation | ✅ Stable | Tested on RTX 3060, handles anime well |
+| Emoji overlays | ✅ Complete | Context-aware (fight/shock/funny), varied per clip |
+| CTA coloring | ✅ Complete | Subscribe/Like/Channel with accent colors |
+| ASS subtitle support | ✅ Fixed | No truncation, proper escape handling |
+| Per-clip duration | ✅ Working | Each clip independent length (not total) |
+| UI | ✅ Functional | Tkinter-based, supports all major options |
+| CUDA optimization | ✅ Working | NVENC support with memory limits (3 workers max) |
+| Language detection | ✅ Accurate | Whisper-based multi-sample detection |
+| Parallel export | ✅ Optimized | ThreadPoolExecutor with GPU-aware worker limits |
+
+---
+
+## 📚 See Also
+
+- **FUTURE_IMPROVEMENTS.md** — Planned enhancements (batch processing, ML scoring, analytics, etc.)
+- **auto_important_clips.py** — Source code with inline comments
+- **clip_generator_ui.py** — GUI launcher script
+
