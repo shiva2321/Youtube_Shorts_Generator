@@ -44,21 +44,77 @@ class OverlayTemplate:
 
 
 OVERLAY_TEMPLATES = {
-    "simple": OverlayTemplate(name="simple", top_bar_opacity=0.8, bottom_bar_opacity=0.8, text_style="shadow"),
-    "viral_shorts": OverlayTemplate(name="viral_shorts", header_text="LIKE & SUBSCRIBE", show_branding=True,
-                                    show_subscribe=True, use_gradient=True, gradient_colors=["#0066ff", "#0044aa"],
-                                    text_style="outline", border_width=4, emoji_prefix="🔥 ", emoji_suffix=" 👀"),
-    "neon_vibes": OverlayTemplate(name="neon_vibes", use_gradient=True, gradient_colors=["#ff00cc", "#333399"],
-                                  text_style="glow", show_branding=True, emoji_prefix="✨ ", emoji_suffix=" ✨"),
-    "glass_modern": OverlayTemplate(name="glass_modern", top_bar_color="black", bottom_bar_color="black",
-                                    top_bar_opacity=0.4, bottom_bar_opacity=0.4, text_style="shadow", border_width=2,
-                                    show_branding=True, emoji_prefix="👉 ", emoji_suffix=" 👈"),
-    "cinematic": OverlayTemplate(name="cinematic", top_bar_color="black", bottom_bar_color="black", top_bar_opacity=1.0,
-                                 bottom_bar_opacity=1.0, text_style="shadow", text_color="#f0f0f0",
-                                 emoji_prefix="", emoji_suffix=""),
-    "anime": OverlayTemplate(name="anime", top_bar_color="#0066cc", bottom_bar_color="#0066cc",
-                             top_bar_opacity=0.85, bottom_bar_opacity=0.85, text_style="outline",
-                             text_color="#ffffff", border_width=4, emoji_prefix="⭐ ", emoji_suffix=" ⭐"),
+    "simple": OverlayTemplate(
+        name="simple",
+        top_bar_opacity=0.8,
+        bottom_bar_opacity=0.8,
+        text_style="shadow",
+        emoji_prefix="",
+        emoji_suffix=""
+    ),
+    "viral_shorts": OverlayTemplate(
+        name="viral_shorts",
+        header_text="LIKE & SUBSCRIBE",
+        show_branding=True,
+        show_subscribe=True,
+        use_gradient=True,
+        gradient_colors=["#0066ff", "#0044aa"],
+        text_style="outline",
+        border_width=4,
+        emoji_prefix="🔥 ",
+        emoji_suffix=" 👀"
+    ),
+    "neon_vibes": OverlayTemplate(
+        name="neon_vibes",
+        header_text="DON'T MISS THIS",
+        use_gradient=True,
+        gradient_colors=["#ff00cc", "#333399"],
+        text_style="glow",
+        show_branding=True,
+        show_subscribe=True,
+        emoji_prefix="✨ ",
+        emoji_suffix=" ✨"
+    ),
+    "glass_modern": OverlayTemplate(
+        name="glass_modern",
+        top_bar_color="black",
+        bottom_bar_color="black",
+        top_bar_opacity=0.4,
+        bottom_bar_opacity=0.4,
+        text_style="shadow",
+        border_width=2,
+        show_branding=True,
+        show_subscribe=True,
+        emoji_prefix="👉 ",
+        emoji_suffix=" 👈"
+    ),
+    "cinematic": OverlayTemplate(
+        name="cinematic",
+        top_bar_color="black",
+        bottom_bar_color="black",
+        top_bar_opacity=1.0,
+        bottom_bar_opacity=1.0,
+        text_style="shadow",
+        text_color="#f0f0f0",
+        show_branding=True,
+        show_subscribe=True,
+        emoji_prefix="",
+        emoji_suffix=""
+    ),
+    "anime": OverlayTemplate(
+        name="anime",
+        top_bar_color="#0066cc",
+        bottom_bar_color="#0066cc",
+        top_bar_opacity=0.85,
+        bottom_bar_opacity=0.85,
+        text_style="outline",
+        text_color="#ffffff",
+        border_width=4,
+        show_branding=True,
+        show_subscribe=True,
+        emoji_prefix="⭐ ",
+        emoji_suffix=" ⭐"
+    ),
 }
 
 
@@ -128,16 +184,13 @@ def detect_audio_language(video_path: str) -> str:
         print(f"[Language Detection] Using {device} for language detection")
 
         # Extract multiple audio samples for more accurate detection
-        # We'll take samples from different parts of the video
         duration = get_video_duration(video_path)
 
         # Define sample points (skip intro, take from multiple points)
         sample_points = []
         if duration < 300:  # Short video under 5 minutes
-            # For short videos, just take one sample from the middle
             sample_points = [(duration * 0.5, min(30, duration * 0.5))]
         else:
-            # For longer videos, take multiple samples
             sample_points = [
                 (max(90, duration * 0.1), 30),  # 10% in (after intro)
                 (duration * 0.4, 30),  # 40% in
@@ -269,6 +322,7 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
     if device == "cuda":
         try:
             # Get available GPU memory in GB
+            import torch
             free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
             gpu_memory_gb = free_memory / (1024 ** 3)
             print(f"[Whisper] Available GPU memory: {gpu_memory_gb:.2f} GB")
@@ -294,7 +348,8 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
 
     if use_chunking:
         print(
-            f"[Whisper] Memory requirements ({required_memory:.1f}GB) exceed available GPU memory, using optimized chunking")
+            f"[Whisper] Memory requirements ({required_memory:.1f}GB) exceed available GPU memory, using optimized chunking"
+        )
         # Optimize chunk size based on available memory
         chunk_size = min(300, max(60, int(600 * (gpu_memory_gb / required_memory))))
         print(f"[Whisper] Using {chunk_size}s chunks for optimal GPU performance")
@@ -323,8 +378,10 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
 
         # Language handling
         lang_arg = None if language == "auto" else language
-        if language == "japanese": lang_arg = "ja"
-        if language == "english": lang_arg = "en"
+        if language == "japanese":
+            lang_arg = "ja"
+        if language == "english":
+            lang_arg = "en"
 
         print(f"[Whisper] Transcribing with language setting: {language}")
 
@@ -335,7 +392,6 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
             # Use more aggressive compression for long files to fit in memory
             if duration > 1800 and device == "cuda":  # > 30 minutes
                 print("[Whisper] Long audio detected, using memory-efficient processing")
-                # For very long files, we need to be careful with memory
                 result = model.transcribe(
                     audio_path,
                     language=lang_arg,
@@ -380,7 +436,7 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
                     f.write(f"{i + 1}\n{start} --> {end}\n{text}\n\n")
         else:
             # Process in optimized chunks with overlap for better transitions
-            print(f"[Whisper] Processing in optimized chunks with overlap for seamless transitions")
+            print("[Whisper] Processing in optimized chunks with overlap for seamless transitions")
 
             all_segments = []
             detected_language = None
@@ -394,7 +450,8 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
                     break  # Skip processing if this chunk would be too small
 
                 print(
-                    f"[Whisper] Processing chunk {chunk_start / 60:.1f}-{(chunk_start + chunk_duration) / 60:.1f} minutes...")
+                    f"[Whisper] Processing chunk {chunk_start / 60:.1f}-{(chunk_start + chunk_duration) / 60:.1f} minutes..."
+                )
 
                 # Extract audio chunk
                 chunk_audio = os.path.join(os.path.dirname(srt_path), f"temp_chunk_{chunk_start}.wav")
@@ -411,15 +468,11 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
 
                 # Adjust timestamps to account for chunk position
                 for segment in chunk_result["segments"]:
-                    # Adjust timestamps
                     segment["start"] += chunk_start
                     segment["end"] += chunk_start
 
-                    # Only include segments that start within this chunk's primary range
-                    # (excluding the overlap region with the next chunk)
+                    # Include segments excluding overlapping regions
                     if chunk_start == 0 or segment["start"] >= chunk_start:
-                        # For chunks after the first one, exclude segments that start in the overlap region
-                        # with the previous chunk (they were already included)
                         if chunk_start == 0 or segment["start"] >= chunk_start + overlap:
                             all_segments.append(segment)
 
@@ -429,7 +482,8 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
                 print(f"[Whisper] Chunk processed in {elapsed:.2f} seconds")
 
                 # Free up GPU memory
-                torch.cuda.empty_cache()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
 
             # Report detected language if auto was used
             if detected_language:
@@ -463,6 +517,7 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
 
         # Final GPU cleanup
         if device == "cuda":
+            import torch
             torch.cuda.empty_cache()
 
     print(f"[Whisper] Saved transcript to {srt_path}")
@@ -471,7 +526,7 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
 
 def parse_srt(srt_path: str) -> List[Candidate]:
     """Parses an SRT file into Candidate objects."""
-    candidates = []
+    candidates: List[Candidate] = []
     if not os.path.exists(srt_path):
         return candidates
 
@@ -486,9 +541,10 @@ def parse_srt(srt_path: str) -> List[Candidate]:
         if len(lines) >= 3:
             # Parse Time: 00:00:00,000 --> 00:00:05,000
             times = lines[1].split(' --> ')
-            if len(times) != 2: continue
+            if len(times) != 2:
+                continue
 
-            def time_to_sec(t_str):
+            def time_to_sec(t_str: str) -> float:
                 h, m, s = t_str.replace(',', '.').split(':')
                 return int(h) * 3600 + int(m) * 60 + float(s)
 
@@ -497,7 +553,7 @@ def parse_srt(srt_path: str) -> List[Candidate]:
                 end = time_to_sec(times[1])
                 text = " ".join(lines[2:])
                 candidates.append(Candidate(start, end, text))
-            except:
+            except Exception:
                 continue
     return candidates
 
@@ -508,7 +564,8 @@ def parse_srt(srt_path: str) -> List[Candidate]:
 
 def get_system_font_path(font_name: str) -> str:
     """Smart cross-platform font finder."""
-    if os.path.exists(font_name): return os.path.abspath(font_name)
+    if os.path.exists(font_name):
+        return os.path.abspath(font_name)
     system = platform.system()
     search_dirs = []
     if system == "Windows":
@@ -548,11 +605,13 @@ def get_system_font_path(font_name: str) -> str:
 def resolve_exe(tool_name: str) -> str:
     """Find executable."""
     path = shutil.which(tool_name)
-    if path: return path
+    if path:
+        return path
     if platform.system() == "Windows":
         common = [r"C:\Program Files\ffmpeg\bin\ffmpeg.exe", r"C:\ffmpeg\bin\ffmpeg.exe"]
         for p in common:
-            if os.path.exists(p): return p
+            if os.path.exists(p):
+                return p
     raise FileNotFoundError(f"Could not find {tool_name}.")
 
 
@@ -595,14 +654,17 @@ def _smart_extract(text: str, mode: str) -> str:
     sentences = re.split(r'(?<=[.!?。！？])\s*', text)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 2]
 
-    if not sentences: return text[:50]
+    if not sentences:
+        return text[:50]
 
     if mode == "hook":
         # Strategy: Questions or Exclamations first
         for s in sentences[:4]:
-            if any(p in s for p in ["?", "？"]) and len(s) < 60: return s
+            if any(p in s for p in ["?", "？"]) and len(s) < 60:
+                return s
         for s in sentences[:4]:
-            if any(p in s for p in ["!", "！"]) and len(s) < 50: return s
+            if any(p in s for p in ["!", "！"]) and len(s) < 50:
+                return s
         return sentences[0]
 
     elif mode == "punchline":
@@ -631,97 +693,324 @@ def get_hook_punchline(text: str) -> Tuple[str, str]:
 
 
 # ==========================================
+# 4b. Clip Scoring & Merging for Better Selection
+# ==========================================
+
+def compute_heuristic_score(cand: Candidate, video_duration: Optional[float] = None) -> float:
+    """
+    Simple heuristic scoring:
+    - Boost questions/exclamations
+    - Penalize very short or very long segments
+    - Prefer segments away from intros/outros
+    """
+    text = cand.text.strip()
+    length = len(text)
+    dur = max(0.1, cand.end - cand.start)
+
+    score = 0.0
+
+    # Basic content features
+    if "?" in text or "？" in text:
+        score += 2.0
+    if "!" in text or "！" in text:
+        score += 1.5
+
+    # Numbers / "listicle" style
+    if re.search(r"\b\d+\b", text):
+        score += 0.8
+
+    # Some "interest" keywords (customizable)
+    keywords = [
+        "secret", "crazy", "insane", "best", "worst", "mistake", "tips",
+        "how to", "you won't", "you will", "the reason", "truth", "behind",
+        "story", "learn", "amazing", "incredible", "unbelievable",
+    ]
+    lowered = text.lower()
+    for kw in keywords:
+        if kw in lowered:
+            score += 1.0
+
+    # Duration: prefer ~8–25s segments
+    if dur < 5:
+        score -= 1.0
+    elif 5 <= dur <= 25:
+        score += 1.5
+    elif dur > 45:
+        score -= 0.8
+
+    # Penalize extremely short text
+    if length < 15:
+        score -= 0.8
+
+    # Position in video
+    if video_duration:
+        mid = (cand.start + cand.end) / 2
+        rel = mid / video_duration
+        # lightly penalize first/last 5% unless very strong
+        if rel < 0.05 or rel > 0.95:
+            score -= 0.5
+        # central 20–80% gets small boost
+        if 0.2 <= rel <= 0.8:
+            score += 0.5
+
+    return score
+
+
+def merge_adjacent_candidates(
+        candidates: List[Candidate],
+        max_clip_len: float = 60.0,
+        min_clip_len: float = 8.0
+) -> List[Candidate]:
+    """
+    Merge subtitle segments into more natural clip-sized chunks.
+    Tries to keep each clip between min_clip_len and max_clip_len seconds.
+    """
+    merged: List[Candidate] = []
+    if not candidates:
+        return merged
+
+    current: List[Candidate] = []
+    curr_start = candidates[0].start
+    curr_end = candidates[0].end
+    text_parts: List[str] = []
+
+    for cand in candidates:
+        cand_dur = cand.end - cand.start
+
+        # If no current chunk, start one
+        if not current:
+            current.append(cand)
+            curr_start, curr_end = cand.start, cand.end
+            text_parts = [cand.text]
+            continue
+
+        new_end = cand.end
+        tentative_dur = new_end - curr_start
+
+        if tentative_dur <= max_clip_len:
+            # merge into current
+            current.append(cand)
+            curr_end = new_end
+            text_parts.append(cand.text)
+        else:
+            # finalize current
+            combined_text = " ".join(text_parts).strip()
+            dur = max(0.1, curr_end - curr_start)
+            if dur >= min_clip_len:
+                merged.append(Candidate(curr_start, curr_end, combined_text))
+            # start new chunk
+            current = [cand]
+            curr_start, curr_end = cand.start, cand.end
+            text_parts = [cand.text]
+
+    # finalize last chunk
+    if current:
+        combined_text = " ".join(text_parts).strip()
+        dur = max(0.1, curr_end - curr_start)
+        if dur >= min_clip_len:
+            merged.append(Candidate(curr_start, curr_end, combined_text))
+
+    return merged
+
+
+def llm_score_candidate(
+        cand: Candidate,
+        clip_index: int,
+        video_context: Optional[str] = None
+) -> float:
+    """
+    OPTIONAL: Hook for scoring clips using an external LLM (local or remote).
+    By default, returns 0.0 (no contribution).
+
+    You can implement your own logic here, for example:
+    - call a local server (Ollama, LM Studio, etc.)
+    - call OpenAI / another API
+    - cache scores based on (start, end, text)
+
+    Return a score in range roughly [-3, +3] to combine with heuristic.
+    """
+    # Example pseudo-implementation (commented out):
+    # prompt = f"... use cand.text and maybe video_context ..."
+    # score = call_my_llm(prompt)
+    # return float(score)
+    return 0.0
+
+
+# ==========================================
 # 5. FFmpeg Filter Construction
 # ==========================================
 
 def build_filter_chain(clip: Candidate, idx: int, cfg: argparse.Namespace, resolution: Tuple[int, int]) -> str:
     target_w, target_h = resolution
-    filters = []
+    filters: List[str] = []
 
-    # 1. Scale/Crop
+    # Enhanced Scale/Crop with smarter aspect ratio handling
     if cfg.aspect_mode == "fill":
-        filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}")
-    else:  # fit
+        # Fill mode: cover the entire frame but may crop edges
         filters.append(
-            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black")
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+            f"crop={target_w}:{target_h}"
+        )
+    elif cfg.aspect_mode == "fit":
+        # Fit mode: ensure the entire original video is visible with letterboxing/pillarboxing
+        # Use a slight blur effect on the background to make it look more professional
+        filters.append(
+            f"split[original][bg];"
+            f"[bg]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},boxblur=10[blurbg];"
+            f"[original]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease[scaled];"
+            f"[blurbg][scaled]overlay=(W-w)/2:(H-h)/2"
+        )
+    else:  # fallback to basic fit
+        filters.append(
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
 
     # 2. Overlay
     if cfg.template_style:
         tpl = OVERLAY_TEMPLATES.get(cfg.template_style, OVERLAY_TEMPLATES["simple"])
         hook, punchline = get_hook_punchline(clip.text)
 
-        # Format text with emojis (only once)
+        # Decide what goes on top and bottom
         try:
-            top_txt = cfg.overlay_top_text.format(hook=hook, punchline=punchline, channel=cfg.channel_name, i=idx)
-            bot_txt = cfg.overlay_bottom_text.format(hook=hook, punchline=punchline, channel=cfg.channel_name, i=idx)
+            clip_duration = clip.end - clip.start
+            is_intro_clip = (idx == 1 and clip.start < 90)  # first 90 s of video
+            is_outro_clip = (clip_duration < 30 and len(clip.text) < 120)
 
-            # Add emojis only once
+            # Choose primary text based on clip position/nature
+            if is_intro_clip:
+                primary_text = hook
+            elif is_outro_clip:
+                primary_text = punchline
+            else:
+                # Use longer of hook/punchline that still fits nicely
+                primary_text = hook if len(hook) >= len(punchline) else punchline
+
+            # Top text
+            top_txt = cfg.overlay_top_text.format(
+                hook=hook,
+                punchline=punchline,
+                primary=primary_text,
+                channel=cfg.channel_name,
+                i=idx,
+            )
+
+            # Bottom text: prefer subscribe CTA if we have channel
+            if cfg.channel_name and tpl.show_subscribe:
+                bottom_default = f"Subscribe {cfg.channel_name}"
+            elif tpl.show_branding and cfg.channel_name:
+                bottom_default = cfg.channel_name
+            else:
+                bottom_default = punchline or hook
+
+            bot_txt = cfg.overlay_bottom_text.format(
+                hook=hook,
+                punchline=punchline,
+                primary=primary_text,
+                channel=cfg.channel_name,
+                i=idx,
+            )
+
+            # If user left default placeholders, enforce our bottom_default
+            if cfg.overlay_bottom_text in ("{punchline}", "{hook}", "{primary}"):
+                bot_txt = bottom_default
+
+            # Add emojis only once to top text
             if tpl.emoji_prefix and not top_txt.startswith(tpl.emoji_prefix):
                 top_txt = f"{tpl.emoji_prefix}{top_txt}"
             if tpl.emoji_suffix and not top_txt.endswith(tpl.emoji_suffix):
                 top_txt = f"{top_txt}{tpl.emoji_suffix}"
-        except:
-            top_txt, bot_txt = hook, punchline
+        except Exception:
+            top_txt = hook
+            bot_txt = punchline or cfg.channel_name or ""
 
-        # Escape text for FFmpeg
-        top_txt_escaped = escape_text_for_ffmpeg(top_txt)
-        bot_txt_escaped = escape_text_for_ffmpeg(bot_txt)
+        # Soft limit on text length to avoid overflowing the screen
+        def shorten_for_overlay(t: str, max_chars: int = 80) -> str:
+            t = t.strip()
+            # Additional check to further limit text length
+            words = t.split()
+            if len(words) > 10:  # Too many words
+                t = ' '.join(words[:10])
+                # Don't add "..." if it ends with an emoji
+                if t and not any(unicodedata.category(c) == 'So' for c in t[-2:]):
+                    t += "..."
+            elif len(t) > max_chars:
+                # Truncate at word boundary
+                truncated = t[:max_chars - 3]
+                last_space = truncated.rfind(' ')
+                if last_space > max_chars * 0.7:
+                    t = t[:last_space] + "..."
+                else:
+                    t = truncated + "..."
+            return t
 
-        # Check if text contains Japanese/CJK characters
-        has_cjk = any(unicodedata.east_asian_width(c) in ('F', 'W') for c in top_txt + bot_txt)
+        # Use stricter length limits
+        top_txt = shorten_for_overlay(top_txt, 80)
+        bot_txt = shorten_for_overlay(bot_txt, 60)
 
-        # Get appropriate font for text content (especially for CJK characters)
-        font_path = get_system_font_path(cfg.overlay_font)
-        if not font_path and has_cjk:
-            # If text contains CJK characters and no font specified, try to find a suitable one
-            font_path = get_system_font_path("Noto Sans CJK")
+        # Calculate font size BEFORE creating overlay assets
+        is_vertical = target_h > target_w
+        fs_base = int(target_h * (0.04 if is_vertical else 0.05))
 
-        # Fix the font path format for FFmpeg
-        if font_path:
-            font_path = font_path.replace('\\', '/').replace(':', '\\:')
-            font_arg = f":fontfile='{font_path}'"
-        else:
-            font_arg = ""
-
-        # Adjust font size based on content type
-        fs_base = int(target_h * 0.05)  # Base font size
-        if has_cjk:
-            fs_base = int(target_h * 0.04)  # Smaller for CJK characters
-
-        # Bars - improved positioning
+        # Bars
+        bar_height_pct = 0.2
         if tpl.use_gradient:
             c1, c2 = tpl.gradient_colors
-            filters.append(f"drawbox=x=0:y=0:w=iw:h={int(target_h * 0.18)}:color={c1}@0.9:t=fill")
-            filters.append(f"drawbox=x=0:y={int(target_h * 0.82)}:w=iw:h={int(target_h * 0.18)}:color={c2}@0.9:t=fill")
+            filters.append(
+                f"drawbox=x=0:y=0:w=iw:h={int(target_h * bar_height_pct)}:color={c1}@0.9:t=fill"
+            )
+            filters.append(
+                f"drawbox=x=0:y={int(target_h * (1 - bar_height_pct))}:w=iw:h={int(target_h * bar_height_pct)}:color={c2}@0.9:t=fill"
+            )
         else:
             if tpl.top_bar_opacity > 0:
                 filters.append(
-                    f"drawbox=x=0:y=0:w=iw:h={int(target_h * 0.18)}:color={tpl.top_bar_color}@{tpl.top_bar_opacity}:t=fill")
+                    f"drawbox=x=0:y=0:w=iw:h={int(target_h * bar_height_pct)}:color={tpl.top_bar_color}@{tpl.top_bar_opacity}:t=fill"
+                )
             if tpl.bottom_bar_opacity > 0:
                 filters.append(
-                    f"drawbox=x=0:y={int(target_h * 0.82)}:w=iw:h={int(target_h * 0.18)}:color={tpl.bottom_bar_color}@{tpl.bottom_bar_opacity}:t=fill")
+                    f"drawbox=x=0:y={int(target_h * (1 - bar_height_pct))}:w=iw:h={int(target_h * bar_height_pct)}:color={tpl.bottom_bar_color}@{tpl.bottom_bar_opacity}:t=fill"
+                )
 
-        # Text - improved positioning and styling
-        if tpl.text_style == "outline":
-            border = f":borderw={tpl.border_width}:bordercolor=black"
-        elif tpl.text_style == "glow":
-            border = f":shadowx=0:shadowy=0:shadowcolor=black@0.8:box=1:boxcolor=black@0.2:boxborderw=5"
-        else:  # shadow
-            border = ":shadowx=2:shadowy=2:shadowcolor=black@0.8"
+        # --- Overlay backend selection ---
+        # Prefer ASS (libass) when available in ffmpeg build; fallback to PNG overlay (Pillow)
+        overlay_backend = getattr(cfg, "overlay_backend", "ass")
 
-        # Fix the vertical positioning - use fixed pixel values instead of expressions
-        top_y_pos = int(target_h * 0.09)  # 9% of height
-        bottom_y_pos = int(target_h * 0.91)  # 91% of height
+        if overlay_backend == "ass":
+            ass_file = os.path.join(cfg.workdir, f"overlay_{idx}.ass")
+            top_y_pos = int(target_h * bar_height_pct / 2)
+            bottom_y_pos = int(target_h * (1 - bar_height_pct / 2))
 
-        # Top text - centered with fixed vertical positioning
-        filters.append(
-            f"drawtext=text='{top_txt_escaped}'{font_arg}:fontcolor={tpl.text_color}:fontsize={fs_base}"
-            f"{border}:x=(w-text_w)/2:y={top_y_pos}:line_spacing=5")
+            with open(ass_file, 'w', encoding='utf-8') as f:
+                f.write('[Script Info]\n')
+                f.write('ScriptType: v4.00+\n')
+                f.write(f'PlayResX: {target_w}\n')
+                f.write(f'PlayResY: {target_h}\n')
+                f.write('WrapStyle: 2\n')
+                f.write('ScaledBorderAndShadow: yes\n\n')
 
-        # Bottom text - centered with fixed vertical positioning
-        filters.append(
-            f"drawtext=text='{bot_txt_escaped}'{font_arg}:fontcolor={tpl.text_color}:fontsize={int(fs_base * 0.9)}"
-            f"{border}:x=(w-text_w)/2:y={bottom_y_pos}-text_h:line_spacing=5")
+                f.write('[V4+ Styles]\n')
+                f.write('Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n')
+                # Alignment 8 = top center; 2 = bottom center
+                f.write(f'Style: Top,Arial,{fs_base},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,2,8,30,30,{top_y_pos},1\n')
+                f.write(f'Style: Bottom,Arial,{int(fs_base * 0.9)},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,2,2,30,30,{target_h - bottom_y_pos},1\n\n')
+
+                f.write('[Events]\n')
+                f.write('Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n')
+                f.write(f'Dialogue: 0,0:00:00.00,9:59:59.99,Top,,0,0,0,,{top_txt}\n')
+                f.write(f'Dialogue: 0,0:00:00.00,9:59:59.99,Bottom,,0,0,0,,{bot_txt}\n')
+
+            # FFmpeg ass filter on Windows requires escaping drive colon (D:) as D\:
+            ass_path = os.path.abspath(ass_file).replace('\\', '/')
+            if len(ass_path) >= 2 and ass_path[1] == ':':
+                ass_path = ass_path[0] + r"\:" + ass_path[2:]
+            # Quote to preserve spaces
+            filters.append(f"ass=filename='{ass_path}'")
+
+        elif overlay_backend == "png":
+            # Defer actual PNG overlay generation to export stage (needs extra input)
+            # Marker placeholder; export stage will replace vf+inputs.
+            filters.append("__PNG_OVERLAY__")
 
     return ",".join(filters)
 
@@ -732,7 +1021,26 @@ def build_filter_chain(clip: Candidate, idx: int, cfg: argparse.Namespace, resol
 
 def run_ffmpeg(args):
     cmd, log = args
-    with open(log, "w") as f: subprocess.run(cmd, stdout=f, stderr=f)
+    try:
+        with open(log, "w", encoding='utf-8') as f:
+            result = subprocess.run(cmd, stdout=f, stderr=f, check=False)
+
+        # Check if FFmpeg actually succeeded
+        if result.returncode != 0:
+            with open(log, "r", encoding='utf-8') as f:
+                error_content = f.read()
+            raise RuntimeError(f"FFmpeg failed with return code {result.returncode}. Check log for details")
+
+        # Verify the output file was actually created
+        output_file = cmd[-1]
+        if not os.path.exists(output_file):
+            with open(log, "r", encoding='utf-8') as f:
+                error_content = f.read()
+            raise RuntimeError(f"FFmpeg completed but output file not created: {output_file}")
+
+        return True
+    except Exception as e:
+        raise RuntimeError(f"FFmpeg error: {e}")
 
 
 def main():
@@ -752,10 +1060,16 @@ def main():
     parser.add_argument("--num-clips", type=int, default=5)
     parser.add_argument("--skip-intro", type=float, default=0)
     parser.add_argument("--skip-outro", type=float, default=0)
+    parser.add_argument(
+        "--target-length",
+        type=int,
+        default=180,
+        help="Target clip length (PER CLIP) in seconds",
+    )
 
     # Export Settings
     parser.add_argument("--target-res", default="1080x1920")
-    parser.add_argument("--aspect-mode", default="fit")
+    parser.add_argument("--aspect-mode", default="fit", choices=["fit", "fill"])
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--encoder", default="auto")
 
@@ -765,13 +1079,14 @@ def main():
     parser.add_argument("--overlay-font", default="Arial")
     parser.add_argument("--overlay-top-text", default="{hook}")
     parser.add_argument("--overlay-bottom-text", default="{punchline}")
+    parser.add_argument("--overlay-backend", default="ass", choices=["ass", "png"], help="Overlay backend: 'ass' (libass) or 'png' (Pillow rendered).")
 
     args = parser.parse_args()
 
     try:
         global FFMPEG
         FFMPEG = resolve_exe("ffmpeg")
-    except:
+    except Exception:
         print("Error: FFmpeg not found.")
         sys.exit(1)
 
@@ -789,7 +1104,7 @@ def main():
 
     # Check for anime content and set appropriate template and font
     if "anime" in video_name.lower() or "naruto" in video_name.lower() or "manga" in video_name.lower():
-        print(f"Anime content detected, using anime template")
+        print("Anime content detected, using anime template")
         args.template_style = "anime"
         args.overlay_font = "Noto Sans CJK JP"  # Better for Japanese text
 
@@ -800,6 +1115,11 @@ def main():
         if detected_language != "auto":
             args.language = detected_language
             print(f"Auto-detected language from audio: {args.language}")
+
+    # Validate and adjust target length (PER CLIP)
+    if args.target_length:
+        args.target_length = min(300, max(10, int(args.target_length)))
+        print(f"Target clip length (per clip): {args.target_length} seconds")
 
     # 1. Handle Transcript / Whisper
     srt_file = args.transcript
@@ -827,13 +1147,14 @@ def main():
                 transcript_output = os.path.join(args.outdir, f"{args.output_prefix}_transcript.srt")
 
                 # Transcribe the video
-                srt_file = transcribe_video(video_path=args.video,
-                                            model_size=args.whisper_model,
-                                            language=args.language,
-                                            transcript_output=transcript_output)
+                srt_file = transcribe_video(
+                    video_path=args.video,
+                    model_size=args.whisper_model,
+                    language=args.language,
+                    transcript_output=transcript_output,
+                )
 
-                # No need to make a duplicate copy
-                print(f"Transcript saved to output directory")
+                print("Transcript saved to output directory")
 
     # 2. Parse & Select Clips
     candidates = parse_srt(srt_file)
@@ -848,7 +1169,7 @@ def main():
         segment_duration = 60
         candidates = [
             Candidate(i * segment_duration, (i + 1) * segment_duration, f"Clip {i + 1}")
-            for i in range(min(args.num_clips, int(duration // segment_duration)))
+            for i in range(min(args.num_clips * 3, int(duration // segment_duration)))
         ]
 
     # Skip intro if specified
@@ -856,77 +1177,181 @@ def main():
         print(f"Skipping first {args.skip_intro} seconds (intro)")
         candidates = [c for c in candidates if c.start >= args.skip_intro]
 
-    # Simple Selection (In real usage, you'd score them here)
-    # We filter out very short segments or merge them
-    # For now, we group segments into 60s chunks roughly
-    final_clips = []
-    current_chunk = []
-    current_dur = 0
+    # Improved Selection: merge into clip-sized chunks, then score
+    print("Building candidate clips from subtitles...")
+    duration = get_video_duration(args.video)
 
-    for cand in candidates:
-        dur = cand.end - cand.start
-        if current_dur + dur < 60:
-            current_chunk.append(cand)
-            current_dur += dur
+    # Use target length to determine optimal clip length
+    target_clip_duration = 20  # Default clip length (seconds)
+    if args.target_length:
+        # target_length is the desired duration for EACH clip, not total
+        target_clip_duration = args.target_length
+        # Constrain to reasonable bounds (8 seconds to 5 minutes)
+        target_clip_duration = min(300.0, max(8.0, target_clip_duration))
+
+    print(f"Target clip duration: ~{target_clip_duration:.1f} seconds per clip")
+    if args.num_clips > 0:
+        total_duration_estimate = target_clip_duration * args.num_clips
+        print(
+            f"Will generate {args.num_clips} clips × {target_clip_duration:.0f}s = ~{total_duration_estimate:.0f}s total")
+
+    merged_candidates = merge_adjacent_candidates(
+        candidates,
+        max_clip_len=target_clip_duration * 1.5,  # Allow some flexibility
+        min_clip_len=target_clip_duration * 0.5,  # Allow some flexibility
+    )
+
+    if not merged_candidates:
+        print("No suitable merged segments found from transcript; using raw segments.")
+        merged_candidates = candidates
+
+    # Ensure we have enough candidates (at least 3x requested clips)
+    if len(merged_candidates) < args.num_clips * 3:
+        print(f"Warning: Only found {len(merged_candidates)} candidate clips. Creating additional candidates...")
+        # Create more candidates by splitting existing ones or using time segments
+        segment_duration = int(target_clip_duration)
+        for i in range(args.num_clips * 3 - len(merged_candidates)):
+            start_time = i * segment_duration
+            if start_time + segment_duration < duration:
+                merged_candidates.append(
+                    Candidate(start_time, start_time + segment_duration, f"Additional clip {i + 1}")
+                )
+
+    # Compute scores
+    print(f"Scoring {len(merged_candidates)} candidate clips...")
+    for idx, cand in enumerate(merged_candidates, start=1):
+        h_score = compute_heuristic_score(cand, video_duration=duration)
+        l_score = llm_score_candidate(cand, clip_index=idx)
+        cand.score = h_score + l_score
+
+        # Boost scores for clips closer to target duration
+        clip_duration = cand.end - cand.start
+        duration_match = 1.0 - min(1.0, abs(clip_duration - target_clip_duration) / target_clip_duration)
+        cand.score += duration_match * 1.5
+
+    # Sort by score descending, avoid heavy overlaps
+    merged_candidates.sort(key=lambda c: c.score, reverse=True)
+
+    # Fix: Ensure we select exactly the requested number of clips
+    num_clips_to_select = args.num_clips
+    print(f"Attempting to select exactly {num_clips_to_select} clips...")
+
+    selected: List[Candidate] = []
+    used_intervals: List[Tuple[float, float]] = []
+
+    def overlaps(a_start, a_end, b_start, b_end, max_overlap_ratio=0.5) -> bool:
+        inter_start = max(a_start, b_start)
+        inter_end = min(a_end, b_end)
+        inter = max(0.0, inter_end - inter_start)
+        len_a = a_end - a_start
+        len_b = b_end - b_start
+        return (inter / max(len_a, 0.1) > max_overlap_ratio) or \
+            (inter / max(len_b, 0.1) > max_overlap_ratio)
+
+    # First pass - select clips while avoiding overlaps
+    for cand in merged_candidates:
+        if len(selected) >= num_clips_to_select:
+            break
+        too_close = False
+        for (us, ue) in used_intervals:
+            if overlaps(cand.start, cand.end, us, ue):
+                too_close = True
+                break
+        if not too_close:
+            selected.append(cand)
+            used_intervals.append((cand.start, cand.end))
+
+    # If we still need more clips, relax the overlap constraints
+    if len(selected) < num_clips_to_select:
+        print(f"First pass only selected {len(selected)} clips. Relaxing overlap constraints...")
+        for cand in merged_candidates:
+            if cand in selected:
+                continue
+            selected.append(cand)
+            used_intervals.append((cand.start, cand.end))
+            if len(selected) >= num_clips_to_select:
+                break
+
+    # Final fallback - if still not enough clips, duplicate some existing clips from different parts
+    if len(selected) < num_clips_to_select:
+        print(f"Not enough unique clips. Creating additional clips...")
+        # If we have some selected clips, duplicate them with slight offsets
+        if selected:
+            clip_count = len(selected)
+            for i in range(num_clips_to_select - clip_count):
+                idx = i % clip_count
+                base_clip = selected[idx]
+                offset = 3.0  # Offset by 3 seconds
+                new_start = max(0, base_clip.start - offset)
+                new_end = min(duration, base_clip.end + offset)
+                selected.append(Candidate(new_start, new_end, f"{base_clip.text} (variant)"))
         else:
-            # Finalize chunk
-            if current_chunk:
-                start = current_chunk[0].start
-                end = current_chunk[-1].end
-                text = " ".join([c.text for c in current_chunk])
-                final_clips.append(Candidate(start, end, text))
-            current_chunk = [cand]
-            current_dur = dur
+            # Last resort - create time-based clips
+            segment_duration = min(30, duration / num_clips_to_select)
+            for i in range(num_clips_to_select):
+                start_time = i * segment_duration
+                end_time = min(duration, start_time + segment_duration)
+                selected.append(Candidate(start_time, end_time, f"Segment {i + 1}"))
 
-    # Add the last chunk if not empty
-    if current_chunk:
-        start = current_chunk[0].start
-        end = current_chunk[-1].end
-        text = " ".join([c.text for c in current_chunk])
-        final_clips.append(Candidate(start, end, text))
+    # Limit to exactly the requested number of clips
+    selected = selected[:num_clips_to_select]
 
-    selected = final_clips[:args.num_clips]
-    print(f"Selected {len(selected)} clips for export.")
+    # Sort by timestamp for sequential output
+    selected.sort(key=lambda c: c.start)
+
+    print(f"Selected exactly {len(selected)} clips for export.")
 
     # 3. Export
     tasks = []
     try:
         w, h = args.target_res.lower().split("x")
         res = (int(w), int(h))
-    except:
+    except Exception:
         res = (1080, 1920)
 
     for i, clip in enumerate(selected):
-        # Create descriptive filename
-        clip_start_time = format_timestamp(clip.start).replace(':', '_').replace(',', '_')
-        out_name = f"{args.output_prefix}_clip_{i + 1:02d}_{clip_start_time}.mp4"
-        out_path = os.path.join(args.outdir, out_name)
-        log_path = os.path.join(args.workdir, f"log_{args.output_prefix}_{i + 1}.txt")
+        try:
+            # Create descriptive filename
+            clip_start_time = format_timestamp(clip.start).replace(':', '_').replace(',', '_')
+            out_name = f"{args.output_prefix}_clip_{i + 1:02d}_{clip_start_time}.mp4"
+            out_path = os.path.join(args.outdir, out_name)
+            log_path = os.path.join(args.workdir, f"log_{args.output_prefix}_{i + 1}.txt")
 
-        vf = build_filter_chain(clip, i + 1, args, res)
+            print(f"Building filter chain for clip {i + 1}/{len(selected)}...")
+            vf = build_filter_chain(clip, i + 1, args, res)
 
-        # Hardware Accel Check - Optimize for RTX 3060
-        v_codec = "libx264"
-        enc_opts = ["-preset", "fast", "-crf", "23"]
+            # Debug: print filter chain
+            print(f"  Filter: {vf[:100]}..." if len(vf) > 100 else f"  Filter: {vf}")
 
-        # For RTX 3060, use NVENC with optimized settings
-        if args.encoder == "nvenc" or (args.encoder == "auto" and shutil.which("nvidia-smi")):
-            v_codec = "h264_nvenc"
-            # Use these optimized settings for RTX 3060
-            enc_opts = ["-preset", "p2", "-tune", "hq", "-cq", "23", "-b:v", "0"]
+            # Hardware Accel Check - Optimize for RTX 3060
+            v_codec = "libx264"
+            enc_opts = ["-preset", "fast", "-crf", "23"]
 
-        cmd = [
-            FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", str(clip.start), "-t", str(clip.end - clip.start),
-            "-i", args.video, "-vf", vf,
-            "-c:v", v_codec, *enc_opts,
-            "-c:a", "aac", "-b:a", "192k",
-            out_path
-        ]
-        tasks.append((cmd, log_path))
+            # For RTX 3060, use NVENC with optimized settings
+            if args.encoder == "nvenc" or (args.encoder == "auto" and shutil.which("nvidia-smi")):
+                v_codec = "h264_nvenc"
+                enc_opts = ["-preset", "p2", "-tune", "hq", "-cq", "23", "-b:v", "0"]
+
+            cmd = [
+                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", str(clip.start), "-t", str(clip.end - clip.start),
+                "-i", args.video, "-vf", vf,
+                "-c:v", v_codec, *enc_opts,
+                "-c:a", "aac", "-b:a", "192k",
+                out_path
+            ]
+            tasks.append((cmd, log_path))
+        except Exception as e:
+            print(f"ERROR: Failed to build task for clip {i + 1}: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Parallel Export - Optimize for RTX 3060
-    # For video encoding, 2-3 parallel jobs is optimal for RTX 3060
+    if not tasks:
+        print("ERROR: No tasks were created. Check errors above.")
+        sys.exit(1)
+
+    print(f"Successfully created {len(tasks)} export tasks")
     max_w = min(args.jobs, 3, os.cpu_count() or 2)
     print(f"Exporting with {max_w} workers (optimized for RTX 3060)...")
 
@@ -938,6 +1363,18 @@ def main():
                 print(f"Clip {i + 1}/{len(tasks)} exported: {os.path.basename(tasks[i][0][-1])}")
             except Exception as e:
                 print(f"Export failed for clip {i + 1}: {e}")
+                log_file = tasks[i][1]
+                if os.path.exists(log_file):
+                    try:
+                        with open(log_file, 'r', encoding='utf-8', errors='ignore') as lf:
+                            error_log = lf.read()
+                            if error_log:
+                                print(f"  FFmpeg error output:\n{error_log[:500]}")
+                    except Exception:
+                        pass
+
+    # Calculate total output duration
+    total_duration = sum(c.end - c.start for c in selected)
 
     # Create a summary file with clip information
     summary_path = os.path.join(args.outdir, f"{args.output_prefix}_summary.txt")
@@ -946,29 +1383,42 @@ def main():
         f.write(f"Processed: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Transcript: {os.path.basename(srt_file)}\n")
         f.write(f"Model: {args.whisper_model}\n")
-        f.write(f"Language: {args.language}\n\n")
+        f.write(f"Language: {args.language}\n")
+        f.write(f"Resolution: {args.target_res}\n")
+        f.write(f"Aspect Mode: {args.aspect_mode}\n")
+        f.write(f"Requested Clips: {num_clips_to_select}\n")
+        f.write(f"Generated Clips: {len(selected)}\n")
+        f.write(f"Clip Length (per clip): {args.target_length}s\n")
+        f.write(f"Total Duration: {total_duration:.1f} seconds ({total_duration / 60:.1f} minutes)\n\n")
         f.write("Clips:\n")
 
         for i, clip in enumerate(selected):
+            clip_duration = clip.end - clip.start
             hook, punchline = get_hook_punchline(clip.text)
             f.write(f"Clip {i + 1}:\n")
-            f.write(f"  Time: {format_timestamp(clip.start)} - {format_timestamp(clip.end)}\n")
+            f.write(f"  Time: {format_timestamp(clip.start)} - {format_timestamp(clip.end)} ({clip_duration:.1f}s)\n")
             f.write(f"  Hook: {hook}\n")
             f.write(f"  Punchline: {punchline}\n")
             f.write(f"  Full text: {clip.text[:100]}{'...' if len(clip.text) > 100 else ''}\n\n")
 
     print(f"Processing complete. Output saved to: {args.outdir}")
+    print(f"Total video duration: {total_duration:.1f} seconds ({total_duration / 60:.1f} minutes)")
     print(f"Summary file created: {summary_path}")
 
     # Clean up any temporary text files that might have been created
-    for f in os.listdir(args.workdir):
-        if f.startswith("t_") and f.endswith(".txt") or f.startswith("b_") and f.endswith(".txt"):
+    for f_name in os.listdir(args.workdir):
+        if (f_name.startswith("t_") and f_name.endswith(".txt")) or \
+                (f_name.startswith("b_") and f_name.endswith(".txt")):
             try:
-                os.remove(os.path.join(args.workdir, f))
-            except:
+                os.remove(os.path.join(args.workdir, f_name))
+            except Exception:
                 pass
 
-
 if __name__ == "__main__":
-    sys.stdout.reconfigure(encoding='utf-8')
+    # Ensure UTF-8 stdout
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        # Fallback for older Python versions
+        pass
     main()

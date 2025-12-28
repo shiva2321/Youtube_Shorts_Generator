@@ -33,9 +33,10 @@ class ToolTip(object):
         self.id = self.widget.after(self.waittime, self.showtip)
 
     def unschedule(self):
-        id = self.id
+        id_ = self.id
         self.id = None
-        if id: self.widget.after_cancel(id)
+        if id_:
+            self.widget.after_cancel(id_)
 
     def showtip(self, event=None):
         x, y, cx, cy = self.widget.bbox("insert")
@@ -44,15 +45,22 @@ class ToolTip(object):
         self.tw = tk.Toplevel(self.widget)
         self.tw.wm_overrideredirect(True)
         self.tw.wm_geometry("+%d+%d" % (x, y))
-        label = tk.Label(self.tw, text=self.text, justify='left',
-                         background="#ffffe0", relief='solid', borderwidth=1,
-                         wraplength=self.wraplength)
+        label = tk.Label(
+            self.tw,
+            text=self.text,
+            justify='left',
+            background="#ffffe0",
+            relief='solid',
+            borderwidth=1,
+            wraplength=self.wraplength
+        )
         label.pack(ipadx=1)
 
     def hidetip(self):
         tw = self.tw
         self.tw = None
-        if tw: tw.destroy()
+        if tw:
+            tw.destroy()
 
 
 class App(tk.Tk):
@@ -81,6 +89,9 @@ class App(tk.Tk):
         self.num_clips = tk.IntVar(value=5)
         self.skip_intro = tk.DoubleVar(value=0.0)
 
+        # Video length selection (in minutes)
+        self.video_length = tk.DoubleVar(value=3.0)
+
         # Whisper Vars
         self.whisper_model = tk.StringVar(value="medium")
         self.whisper_lang = tk.StringVar(value="auto")
@@ -88,8 +99,10 @@ class App(tk.Tk):
         # Overlay
         self.template_style = tk.StringVar(value="viral_shorts")
         self.channel_name = tk.StringVar(value="@MyChannel")
-        self.top_text = tk.StringVar(value="{hook}")
-        self.bot_text = tk.StringVar(value="{punchline}")
+        # Use primary (hook vs punchline decision) for top / bottom by default.
+        self.top_text = tk.StringVar(value="{primary}")
+        # Back-end will convert this into "Subscribe {channel}" if applicable.
+        self.bot_text = tk.StringVar(value="{primary}")
         self.font_path = tk.StringVar()
 
         # Export
@@ -133,18 +146,26 @@ class App(tk.Tk):
         video_entry = ttk.Entry(f, textvariable=self.video_path)
         video_entry.grid(row=0, column=1, **grid_opts)
         video_entry.bind("<FocusOut>", self.check_for_existing_transcript)
-        ttk.Button(f, text="Browse", command=lambda: self._browse_file(self.video_path, "Video")).grid(row=0, column=2,
-                                                                                                       **grid_opts)
+        ttk.Button(
+            f,
+            text="Browse",
+            command=lambda: self._browse_file(self.video_path, "Video")
+        ).grid(row=0, column=2, **grid_opts)
 
         ttk.Label(f, text="SRT (Optional):").grid(row=1, column=0, **grid_opts)
         ttk.Entry(f, textvariable=self.transcript_path).grid(row=1, column=1, **grid_opts)
-        ttk.Button(f, text="Browse", command=lambda: self._browse_file(self.transcript_path, "SRT")).grid(row=1,
-                                                                                                          column=2,
-                                                                                                          **grid_opts)
+        ttk.Button(
+            f,
+            text="Browse",
+            command=lambda: self._browse_file(self.transcript_path, "SRT")
+        ).grid(row=1, column=2, **grid_opts)
 
         # Auto-detect transcript checkbox
-        ttk.Checkbutton(f, text="Auto-detect existing transcript", variable=self.auto_detect_transcript).grid(
-            row=2, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        ttk.Checkbutton(
+            f,
+            text="Auto-detect existing transcript",
+            variable=self.auto_detect_transcript
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=5)
 
         f.columnconfigure(1, weight=1)
 
@@ -153,18 +174,24 @@ class App(tk.Tk):
         f_trans.pack(fill="x", padx=10, pady=5)
 
         ttk.Label(f_trans, text="Model Size:").grid(row=0, column=0, **grid_opts)
-        ttk.Combobox(f_trans, textvariable=self.whisper_model, values=["small", "medium", "large"]).grid(row=0,
-                                                                                                         column=1,
-                                                                                                         **grid_opts)
+        ttk.Combobox(
+            f_trans,
+            textvariable=self.whisper_model,
+            values=["small", "medium", "large"]
+        ).grid(row=0, column=1, **grid_opts)
 
         ttk.Label(f_trans, text="Language:").grid(row=0, column=2, **grid_opts)
-        ttk.Combobox(f_trans, textvariable=self.whisper_lang, values=["auto", "english", "japanese"]).grid(row=0,
-                                                                                                           column=3,
-                                                                                                           **grid_opts)
+        ttk.Combobox(
+            f_trans,
+            textvariable=self.whisper_lang,
+            values=["auto", "english", "japanese"]
+        ).grid(row=0, column=3, **grid_opts)
 
-        lbl_info = ttk.Label(f_trans,
-                             text="ℹ️ If SRT is not provided, this will run automatically. Uses GPU if available.",
-                             foreground="gray")
+        lbl_info = ttk.Label(
+            f_trans,
+            text="ℹ️ If SRT is not provided, this will run automatically. Uses GPU if available.",
+            foreground="gray"
+        )
         lbl_info.grid(row=1, column=0, columnspan=4, sticky="w", padx=5)
 
         # Clipping Logic
@@ -172,11 +199,49 @@ class App(tk.Tk):
         f2.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(f2, text="Clip Count:").grid(row=0, column=0, **grid_opts)
-        ttk.Spinbox(f2, from_=1, to=50, textvariable=self.num_clips, width=5).grid(row=0, column=1, sticky="w", padx=5,
-                                                                                   pady=5)
+        ttk.Spinbox(
+            f2,
+            from_=1,
+            to=50,
+            textvariable=self.num_clips,
+            width=5
+        ).grid(row=0, column=1, sticky="w", padx=5, pady=5)
 
         ttk.Label(f2, text="Skip Intro (s):").grid(row=0, column=2, **grid_opts)
-        ttk.Entry(f2, textvariable=self.skip_intro, width=8).grid(row=0, column=3, sticky="w", padx=5, pady=5)
+        ttk.Entry(f2, textvariable=self.skip_intro, width=8).grid(
+            row=0,
+            column=3,
+            sticky="w",
+            padx=5,
+            pady=5
+        )
+
+        # Video Length Selection
+        ttk.Label(f2, text="Clip Length (each):").grid(row=1, column=0, **grid_opts)
+        length_frame = ttk.Frame(f2)
+        length_frame.grid(row=1, column=1, columnspan=3, sticky="ew", padx=5, pady=5)
+
+        ttk.Scale(
+            length_frame,
+            variable=self.video_length,
+            from_=1.0,
+            to=5.0,
+            orient="horizontal"
+        ).pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        # Display current value
+        length_label = ttk.Label(length_frame, width=6)
+        length_label.pack(side="right")
+
+        # Update label when slider changes
+        def update_length_label(*args):
+            length_label.config(text=f"{self.video_length.get():.1f} min")
+
+        self.video_length.trace_add("write", update_length_label)
+        update_length_label()  # Initialize label
+
+        # Add tooltip with clarification
+        ToolTip(length_frame, "Duration of EACH clip. Total = Clip Length × Number of Clips")
 
     def _build_overlay_tab(self):
         f = ttk.LabelFrame(self.tab_overlay, text="Style", padding=10)
@@ -185,8 +250,11 @@ class App(tk.Tk):
         grid_opts = {'sticky': 'ew', 'padx': 5, 'pady': 5}
 
         ttk.Label(f, text="Template:").grid(row=0, column=0, **grid_opts)
-        cb = ttk.Combobox(f, textvariable=self.template_style,
-                          values=["viral_shorts", "neon_vibes", "glass_modern", "cinematic", "simple"])
+        cb = ttk.Combobox(
+            f,
+            textvariable=self.template_style,
+            values=["viral_shorts", "neon_vibes", "glass_modern", "cinematic", "simple"]
+        )
         cb.grid(row=0, column=1, **grid_opts)
 
         ttk.Label(f, text="Channel Name:").grid(row=1, column=0, **grid_opts)
@@ -194,8 +262,11 @@ class App(tk.Tk):
 
         ttk.Label(f, text="Custom Font:").grid(row=2, column=0, **grid_opts)
         ttk.Entry(f, textvariable=self.font_path).grid(row=2, column=1, **grid_opts)
-        ttk.Button(f, text="Find...", command=lambda: self._browse_file(self.font_path, "Font")).grid(row=2, column=2,
-                                                                                                      **grid_opts)
+        ttk.Button(
+            f,
+            text="Find...",
+            command=lambda: self._browse_file(self.font_path, "Font")
+        ).grid(row=2, column=2, **grid_opts)
 
         f.columnconfigure(1, weight=1)
 
@@ -207,15 +278,71 @@ class App(tk.Tk):
 
         ttk.Label(f, text="Output Dir:").grid(row=0, column=0, **grid_opts)
         ttk.Entry(f, textvariable=self.outdir).grid(row=0, column=1, **grid_opts)
-        ttk.Button(f, text="Browse", command=lambda: self._browse_dir(self.outdir)).grid(row=0, column=2, **grid_opts)
+        ttk.Button(
+            f,
+            text="Browse",
+            command=lambda: self._browse_dir(self.outdir)
+        ).grid(row=0, column=2, **grid_opts)
 
         ttk.Label(f, text="Resolution:").grid(row=1, column=0, **grid_opts)
-        ttk.Combobox(f, textvariable=self.resolution, values=["1080x1920", "1920x1080", "1080x1080"]).grid(row=1,
-                                                                                                           column=1,
-                                                                                                           **grid_opts)
+        resolution_cb = ttk.Combobox(
+            f,
+            textvariable=self.resolution,
+            values=["1080x1920", "1920x1080", "1080x1080", "720x1280", "1280x720", "540x960"]
+        )
+        resolution_cb.grid(row=1, column=1, **grid_opts)
 
-        ttk.Label(f, text="Workers:").grid(row=2, column=0, **grid_opts)
-        ttk.Scale(f, variable=self.jobs, from_=1, to=16, orient="horizontal").grid(row=2, column=1, **grid_opts)
+        # Aspect Mode with improved description
+        ttk.Label(f, text="Aspect Mode:").grid(row=2, column=0, **grid_opts)
+        aspect_frame = ttk.Frame(f)
+        aspect_frame.grid(row=2, column=1, **grid_opts)
+
+        ttk.Radiobutton(
+            aspect_frame,
+            text="Fit",
+            variable=self.aspect_mode,
+            value="fit"
+        ).pack(side="left", padx=(0, 10))
+
+        ttk.Radiobutton(
+            aspect_frame,
+            text="Fill",
+            variable=self.aspect_mode,
+            value="fill"
+        ).pack(side="left")
+
+        # Add tooltips for aspect mode options
+        fit_tip = ToolTip(aspect_frame, "Fit: Preserves original aspect ratio with black bars if needed (no cropping)")
+        fill_tip = ToolTip(aspect_frame, "Fill: Fills the entire frame by zooming and cropping if necessary")
+
+        ttk.Label(f, text="Workers:").grid(row=3, column=0, **grid_opts)
+        ttk.Scale(
+            f,
+            variable=self.jobs,
+            from_=1,
+            to=16,
+            orient="horizontal"
+        ).grid(row=3, column=1, **grid_opts)
+
+        # Add preview section with image showing aspect ratio effects
+        preview_frame = ttk.LabelFrame(f, text="Aspect Ratio Preview", padding=10)
+        preview_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=10)
+
+        preview_text = tk.Text(
+            preview_frame,
+            height=4,
+            bg="#f0f0f0",
+            wrap="word"
+        )
+        preview_text.pack(fill="both")
+        preview_text.insert("1.0",
+                            "Preview of aspect ratio effects:\n\n"
+                            "• Fit: Keeps the entire original scene visible with letterboxing/pillarboxing\n"
+                            "• Fill: Zooms to fill the entire frame which may crop some edges of the scene\n\n"
+                            "Choose 'Fit' if you want to ensure no part of the video is cropped.\n"
+                            "Choose 'Fill' if you want to maximize screen usage without black bars."
+                            )
+        preview_text.config(state="disabled")
 
         f.columnconfigure(1, weight=1)
 
@@ -229,7 +356,13 @@ class App(tk.Tk):
         self.btn_run = ttk.Button(f, text="START PROCESSING", command=self.run_process)
         self.btn_run.pack(side="right", padx=5)
 
-        self.log_widget = tk.Text(parent, height=12, bg="#202020", fg="#eeeeee", font=("Consolas", 9))
+        self.log_widget = tk.Text(
+            parent,
+            height=12,
+            bg="#202020",
+            fg="#eeeeee",
+            font=("Consolas", 9)
+        )
         self.log_widget.pack(fill="both", expand=True, padx=10)
 
     def _browse_file(self, var, type_name):
@@ -248,7 +381,8 @@ class App(tk.Tk):
 
     def _browse_dir(self, var):
         path = filedialog.askdirectory()
-        if path: var.set(path)
+        if path:
+            var.set(path)
 
     def log(self, msg):
         self.log_widget.insert("end", str(msg) + "\n")
@@ -259,7 +393,9 @@ class App(tk.Tk):
             msg = self.log_q.get_nowait()
             self.log(msg)
             if "Clip exported" in str(msg):
-                self.progress_var.set(self.progress_var.get() + (100 / self.num_clips.get()))
+                self.progress_var.set(
+                    self.progress_var.get() + (100 / self.num_clips.get())
+                )
         self.after(100, self.poll_log)
 
     def get_video_filename(self):
@@ -346,6 +482,16 @@ class App(tk.Tk):
             # If no transcript provided, set the path where it should be generated
             transcript_path = os.path.join(video_output_dir, f"{video_filename}_transcript.srt")
 
+        # User sets the length of EACH clip, not total length
+        # E.g., "3 minutes" means each clip is 3 minutes long
+        clip_minutes = self.video_length.get()
+        clip_seconds = int(clip_minutes * 60)
+        total_seconds = clip_seconds * self.num_clips.get()
+        total_minutes = total_seconds / 60
+
+        self.log(f"Clip duration: {clip_minutes:.1f} minutes ({clip_seconds} seconds) per clip")
+        self.log(f"Generating {self.num_clips.get()} clips × {clip_minutes:.1f} min = {total_minutes:.1f} minutes total")
+
         cmd = [
             sys.executable, "auto_important_clips.py",
             "--video", self.video_path.get(),
@@ -354,13 +500,15 @@ class App(tk.Tk):
             "--num-clips", str(self.num_clips.get()),
             "--template-style", self.template_style.get(),
             "--target-res", self.resolution.get(),
+            "--aspect-mode", self.aspect_mode.get(),
             "--jobs", str(self.jobs.get()),
             "--overlay-top-text", self.top_text.get(),
             "--overlay-bottom-text", self.bot_text.get(),
             "--whisper-model", self.whisper_model.get(),
             "--language", self.whisper_lang.get(),
             "--output-prefix", video_filename,  # Use video filename as prefix for output files
-            "--transcript-output", transcript_path  # Specify where to save the transcript
+            "--transcript-output", transcript_path,  # Specify where to save the transcript
+            "--target-length", str(clip_seconds)  # Pass clip duration (each clip length)
         ]
 
         if self.transcript_path.get():
@@ -375,9 +523,12 @@ class App(tk.Tk):
         if self.skip_intro.get() > 0:
             cmd.extend(["--skip-intro", str(self.skip_intro.get())])
 
+
         try:
             self.log(f"Output directory: {video_output_dir}")
             self.log(f"Transcript will be saved to: {transcript_path}")
+            self.log(f"Using aspect mode: {self.aspect_mode.get()}")
+            self.log(f"Target resolution: {self.resolution.get()}")
 
             process = subprocess.Popen(
                 cmd,
