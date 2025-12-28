@@ -12,6 +12,7 @@ import hashlib
 import time
 import unicodedata
 import random
+import json
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional
@@ -269,6 +270,236 @@ def detect_audio_language(video_path: str) -> str:
     return "auto"
 
 
+def get_audio_duration(file_path: str) -> float:
+    """Get the duration of an audio file using ffprobe."""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+        output = subprocess.check_output(cmd, universal_newlines=True).strip()
+        return float(output)
+    except Exception:
+        return 0.0
+
+
+def _merge_ranges(ranges: List[Tuple[float, float]], gap: float = 1.0) -> List[Tuple[float, float]]:
+    """Merge overlapping/nearby ranges."""
+    if not ranges:
+        return []
+    cleaned = []
+    for s, e in ranges:
+        try:
+            s = float(s)
+            e = float(e)
+        except Exception:
+            continue
+        if e > s:
+            cleaned.append((s, e))
+    if not cleaned:
+        return []
+
+    cleaned.sort(key=lambda x: x[0])
+    merged: List[Tuple[float, float]] = [cleaned[0]]
+    for s, e in cleaned[1:]:
+        ps, pe = merged[-1]
+        if s <= pe + float(gap):
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _clamp_ranges(ranges: List[Tuple[float, float]], duration: float) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    for s, e in ranges:
+        s = max(0.0, min(float(s), float(duration)))
+        e = max(0.0, min(float(e), float(duration)))
+        if e > s:
+            out.append((s, e))
+    return out
+
+
+def apply_skip_ranges(candidates: List['Candidate'], skip_ranges: List[Tuple[float, float]], *, overlap_ratio: float = 0.25,
+                      tiny_overlap_seconds: float = 1.5) -> List['Candidate']:
+    """Filter out candidates that overlap skip ranges beyond a threshold."""
+    if not candidates or not skip_ranges:
+        return candidates
+
+    skip_ranges = _merge_ranges(skip_ranges, gap=0.5)
+    out: List[Candidate] = []
+    for c in candidates:
+        dur = max(0.001, c.end - c.start)
+        thresh = max(float(tiny_overlap_seconds), float(overlap_ratio) * dur)
+
+        drop = False
+        for s, e in skip_ranges:
+            ov = max(0.0, min(c.end, e) - max(c.start, s))
+            if ov >= thresh:
+                drop = True
+                break
+        if not drop:
+            out.append(c)
+    return out
+
+
+def detect_content_range(audio_path: str, *, method: str = "inaspeech", intro_scan_max: float = 420.0,
+                         outro_scan_max: float = 420.0, min_music_block: float = 20.0,
+                         min_end_nonspeech: float = 20.0, pad: float = 0.75) -> Tuple[float, float, str]:
+    """Detect approximate (start,end) content range from audio.
+
+    Heuristics:
+    - Intro: large initial music block(s) before sustained speech.
+    - Outro: treat the last sustained speech as content end; if there's a meaningful tail of
+      non-speech/music/noise after last speech, it's an outro/credits.
+
+    Returns (start,end,method_used).
+    """
+    duration = get_audio_duration(audio_path)
+    if duration <= 0:
+        return 0.0, 0.0, "unknown"
+
+    method = (method or "inaspeech").lower()
+    if method in ("none", "off", "disabled"):
+        return 0.0, duration, "none"
+
+    if method not in ("inaspeech", "smart"):
+        return 0.0, duration, "none"
+
+    try:
+        from inaSpeechSegmenter import Segmenter
+        seg = Segmenter(vad_engine='smn', detect_gender=False)
+        segmentation = seg(audio_path)
+
+        # --- Intro detection (scan from start) ---
+        start_cut = 0.0
+        scan_limit = min(float(intro_scan_max), duration)
+        for label, start, end in segmentation:
+            if float(start) >= scan_limit:
+                break
+            block_len = float(end) - float(start)
+            if label == 'music' and block_len >= float(min_music_block):
+                start_cut = max(start_cut, float(end))
+            # Once we reached speech after music, stop.
+            if label == 'speech' and start_cut > 0:
+                break
+
+        # --- Outro detection (scan only last X seconds) ---
+        outro_window_start = max(0.0, duration - float(outro_scan_max))
+        last_speech_end = 0.0
+        last_any_end = 0.0
+        for label, start, end in segmentation:
+            start = float(start)
+            end = float(end)
+            last_any_end = max(last_any_end, end)
+            if end < outro_window_start:
+                continue
+            if label == 'speech':
+                last_speech_end = max(last_speech_end, end)
+
+        # If we didn't see speech in the last window, fall back to last speech in whole file
+        if last_speech_end <= 0.0:
+            for label, start, end in segmentation:
+                if label == 'speech':
+                    last_speech_end = max(last_speech_end, float(end))
+
+        end_cut = duration
+        if last_speech_end > 0:
+            tail = duration - last_speech_end
+            # If there's a meaningful tail of non-speech, cut it.
+            if tail >= float(min_end_nonspeech):
+                end_cut = last_speech_end
+
+        # Pad and clamp
+        start_cut = max(0.0, min(duration, start_cut + float(pad)))
+        end_cut = max(0.0, min(duration, end_cut - float(pad)))
+
+        # Sanity
+        if end_cut - start_cut < max(60.0, duration * 0.15):
+            return 0.0, duration, "inaspeech_rejected"
+
+        return start_cut, end_cut, "inaspeech"
+
+    except ImportError:
+        return 0.0, duration, "inaspeech_missing"
+    except Exception:
+        return 0.0, duration, "inaspeech_error"
+
+
+def load_or_detect_content_range(*, video_path: str, workdir: str, trim_method: str = "inaspeech",
+                                 pad_seconds: float = 0.75, cache: bool = True) -> Tuple[float, float, List[Tuple[float, float]], str]:
+    """Detect and optionally cache intro/outro skip ranges for a video."""
+    duration = get_video_duration(video_path)
+    if duration <= 0:
+        duration = 0.0
+
+    video_hash = get_video_hash(video_path)
+    os.makedirs(workdir, exist_ok=True)
+    cache_path = os.path.join(workdir, f"{video_hash}.trim.json")
+
+    if cache and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cs = float(data.get("content_start", 0.0))
+            ce = float(data.get("content_end", duration if duration > 0 else 0.0))
+            sr = [(float(a), float(b)) for a, b in data.get("skip_ranges", [])]
+            mu = str(data.get("method", "cache"))
+            if ce <= 0 and duration > 0:
+                ce = duration
+            sr = _clamp_ranges(_merge_ranges(sr), duration if duration > 0 else max(ce, cs))
+            return cs, ce, sr, mu
+        except Exception:
+            pass
+
+    temp_audio = os.path.join(workdir, f"{video_hash}.trim_audio.wav")
+    try:
+        extract_audio(video_path, temp_audio)
+        cs, ce, mu = detect_content_range(temp_audio, method=trim_method, pad=pad_seconds)
+
+        if duration > 0:
+            cs = max(0.0, min(cs, duration))
+            ce = max(0.0, min(ce, duration))
+        if ce <= 0 and duration > 0:
+            ce = duration
+
+        skip_ranges: List[Tuple[float, float]] = []
+        if cs > 1.0:
+            skip_ranges.append((0.0, cs))
+
+        # Always add outro range if content_end is meaningfully before duration.
+        # (Previous logic sometimes missed ED when ce was too close to duration.)
+        if duration > 0:
+            # Require at least 10s tail to consider it an outro.
+            if ce < duration - 10.0:
+                skip_ranges.append((ce, duration))
+
+        skip_ranges = _clamp_ranges(_merge_ranges(skip_ranges), duration if duration > 0 else ce)
+
+        if cache:
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "video": video_path,
+                        "duration": duration,
+                        "content_start": cs,
+                        "content_end": ce,
+                        "skip_ranges": skip_ranges,
+                        "method": mu,
+                        "pad_seconds": pad_seconds,
+                        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    }, f, indent=2)
+            except Exception:
+                pass
+
+        return cs, ce, skip_ranges, mu
+
+    finally:
+        if os.path.exists(temp_audio):
+            try:
+                os.remove(temp_audio)
+            except Exception:
+                pass
+
+
 def extract_audio(video_path: str, output_path: str, start_time: float = 0, duration: float = 0) -> bool:
     """Extract audio from video for faster processing."""
     try:
@@ -291,10 +522,21 @@ def extract_audio(video_path: str, output_path: str, start_time: float = 0, dura
         return False
 
 
-def transcribe_video(video_path: str, model_size: str, language: str, transcript_output: Optional[str] = None) -> str:
+def transcribe_video(video_path: str, model_size: str, language: str, transcript_output: Optional[str] = None,
+                    smart_trim: bool = False, trim_method: str = "inaspeech", workdir: Optional[str] = None,
+                    trim_cache: bool = True, force_device: str = "auto") -> str:
     """
-    Transcribes video using OpenAI Whisper with optimized GPU usage.
-    Avoids chunking for better quality and performance.
+    Transcribes video using OpenAI Whisper.
+
+    Device selection:
+    - force_device="auto" (default): use CUDA if available
+    - force_device="cuda": force CUDA (error if unavailable)
+    - force_device="cpu": force CPU
+
+    If smart_trim is enabled, the function will:
+    - Detect content start/end (skipping likely intro/outro)
+    - Transcribe only the content portion
+    - Add the offset back to timestamps so the SRT matches the original video timeline
     """
     try:
         import whisper
@@ -304,7 +546,26 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
         print("    Please run: pip install openai-whisper torch")
         sys.exit(1)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # NEW: GPU diagnostics
+    try:
+        print(f"[CUDA] torch.cuda.is_available() = {torch.cuda.is_available()}")
+        print(f"[CUDA] torch.version.cuda = {getattr(torch.version, 'cuda', None)}")
+        if torch.cuda.is_available():
+            print(f"[CUDA] GPU = {torch.cuda.get_device_name(0)}")
+    except Exception:
+        pass
+
+    force_device = (force_device or "auto").lower()
+    if force_device == "cpu":
+        device = "cpu"
+    elif force_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("force_device=cuda requested but CUDA is not available")
+        device = "cuda"
+    else:
+        # auto: ALWAYS use CUDA when available
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     print(f"\n[Whisper] Loading model '{model_size}' on {device.upper()}...")
 
     # Set output path
@@ -325,6 +586,55 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
     # Get video duration
     duration = get_video_duration(video_path)
     print(f"[Whisper] Video duration: {duration:.2f} seconds")
+
+    # --- Smart trim (optional) ---
+    time_offset = 0.0
+    processing_audio_path = audio_path
+
+    if smart_trim:
+        wd = workdir or os.path.dirname(os.path.abspath(srt_path))
+        try:
+            # NEW: create/reuse a physically trimmed video and derive audio from it
+            trimmed_video, content_start, content_end, _skip_ranges, method_used = maybe_create_trimmed_video(
+                video_path=video_path,
+                workdir=wd,
+                trim_method=trim_method,
+                cache=trim_cache,
+            )
+            if trimmed_video != video_path:
+                print(f"[Smart Trim] Using trimmed video for transcription: {trimmed_video}")
+                # Replace audio extraction source with trimmed video
+                # Also offset SRT timestamps back to original timeline
+                time_offset = float(content_start)
+
+                # Re-extract audio from trimmed video (no intro/outro)
+                if os.path.exists(audio_path):
+                    try:
+                        os.remove(audio_path)
+                    except Exception:
+                        pass
+                extract_audio(trimmed_video, audio_path)
+
+                processing_audio_path = audio_path
+
+            else:
+                # Fallback to audio-only trim when physical trim wasn't possible
+                content_start, content_end, _skip_ranges, method_used = load_or_detect_content_range(
+                    video_path=video_path,
+                    workdir=wd,
+                    trim_method=trim_method,
+                    pad_seconds=0.75,
+                    cache=trim_cache,
+                )
+                if content_end > content_start and (content_start > 5.0 or (duration > 0 and content_end < duration - 5.0)):
+                    print(f"[Smart Trim] Detected content range: {content_start:.1f}s -> {content_end:.1f}s (method={method_used})")
+                    trimmed_audio_path = os.path.join(os.path.dirname(srt_path), "temp_audio_trimmed.wav")
+                    extract_dur = max(0.1, content_end - content_start)
+                    if extract_audio(video_path, trimmed_audio_path, start_time=content_start, duration=extract_dur):
+                        processing_audio_path = trimmed_audio_path
+                        time_offset = float(content_start)
+        except Exception as e:
+            print(f"[Smart Trim] Failed to detect/apply smart trim: {e}")
 
     # Check available GPU memory
     gpu_memory_gb = 0
@@ -349,7 +659,15 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
     }
 
     # For long videos, we need more memory
-    memory_multiplier = min(1.5, max(1.0, duration / 1800))  # Increase for videos > 30 min
+    # When smart-trimming, use the audio duration of what we actually transcribe.
+    effective_duration = duration
+    try:
+        if processing_audio_path != audio_path:
+            effective_duration = get_audio_duration(processing_audio_path) or duration
+    except Exception:
+        effective_duration = duration
+
+    memory_multiplier = min(1.5, max(1.0, effective_duration / 1800))  # Increase for videos > 30 min
     required_memory = memory_requirements.get(model_size, 5) * memory_multiplier
 
     # Process in one go if we have enough memory, otherwise use chunking
@@ -394,15 +712,15 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
 
         print(f"[Whisper] Transcribing with language setting: {language}")
 
-        if chunk_size <= 0 or duration <= chunk_size:
+        if chunk_size <= 0 or effective_duration <= chunk_size:
             # Process entire audio in one go
             start_time = time.time()
 
             # Use more aggressive compression for long files to fit in memory
-            if duration > 1800 and device == "cuda":  # > 30 minutes
+            if effective_duration > 1800 and device == "cuda":  # > 30 minutes
                 print("[Whisper] Long audio detected, using memory-efficient processing")
                 result = model.transcribe(
-                    audio_path,
+                    processing_audio_path,
                     language=lang_arg,
                     verbose=False,
                     fp16=use_half,
@@ -411,7 +729,7 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
             else:
                 # Standard processing for shorter files
                 result = model.transcribe(
-                    audio_path,
+                    processing_audio_path,
                     language=lang_arg,
                     verbose=False,
                     fp16=use_half
@@ -439,8 +757,8 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
             # Write SRT
             with open(srt_path, "w", encoding="utf-8") as f:
                 for i, segment in enumerate(result["segments"]):
-                    start = format_timestamp(segment["start"])
-                    end = format_timestamp(segment["end"])
+                    start = format_timestamp(segment["start"] + time_offset)
+                    end = format_timestamp(segment["end"] + time_offset)
                     text = segment["text"].strip()
                     f.write(f"{i + 1}\n{start} --> {end}\n{text}\n\n")
         else:
@@ -451,50 +769,46 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
             detected_language = None
             overlap = 5  # 5 second overlap between chunks
 
-            # Process video in chunks with overlap
-            for chunk_start in range(0, int(duration), chunk_size - overlap):
-                # Adjust last chunk to not exceed duration
-                chunk_duration = min(chunk_size, duration - chunk_start)
+            # Process audio timeline in chunks with overlap.
+            # If smart-trim is enabled, chunk_start is relative to the trimmed audio, so we add time_offset.
+            for chunk_start in range(0, int(effective_duration), chunk_size - overlap):
+                chunk_duration = min(chunk_size, effective_duration - chunk_start)
                 if chunk_duration <= overlap:
-                    break  # Skip processing if this chunk would be too small
+                    break
 
+                absolute_chunk_start = chunk_start + time_offset
                 print(
-                    f"[Whisper] Processing chunk {chunk_start / 60:.1f}-{(chunk_start + chunk_duration) / 60:.1f} minutes..."
+                    f"[Whisper] Processing chunk {absolute_chunk_start / 60:.1f}-{(absolute_chunk_start + chunk_duration) / 60:.1f} minutes..."
                 )
 
-                # Extract audio chunk
-                chunk_audio = os.path.join(os.path.dirname(srt_path), f"temp_chunk_{chunk_start}.wav")
-                extract_audio(video_path, chunk_audio, chunk_start, chunk_duration)
+                chunk_audio = os.path.join(os.path.dirname(srt_path), f"temp_chunk_{int(absolute_chunk_start)}.wav")
 
-                # Transcribe chunk
+                # Extract from original video so we're always aligned with absolute time.
+                extract_audio(video_path, chunk_audio, absolute_chunk_start, chunk_duration)
+
                 start_time = time.time()
                 chunk_result = model.transcribe(chunk_audio, language=lang_arg, verbose=False, fp16=use_half)
                 elapsed = time.time() - start_time
 
-                # Store detected language from first chunk if using auto
                 if chunk_start == 0 and language == "auto" and "language" in chunk_result:
                     detected_language = chunk_result.get("language")
 
-                # Adjust timestamps to account for chunk position
+                # Adjust timestamps to account for chunk position in original time base
                 for segment in chunk_result["segments"]:
-                    segment["start"] += chunk_start
-                    segment["end"] += chunk_start
+                    segment["start"] += absolute_chunk_start
+                    segment["end"] += absolute_chunk_start
 
-                    # Include segments excluding overlapping regions
-                    if chunk_start == 0 or segment["start"] >= chunk_start:
-                        if chunk_start == 0 or segment["start"] >= chunk_start + overlap:
+                    if chunk_start == 0 or segment["start"] >= absolute_chunk_start:
+                        if chunk_start == 0 or segment["start"] >= absolute_chunk_start + overlap:
                             all_segments.append(segment)
 
-                # Clean up chunk audio
                 os.remove(chunk_audio)
 
                 print(f"[Whisper] Chunk processed in {elapsed:.2f} seconds")
 
-                # Free up GPU memory
                 if device == "cuda":
                     torch.cuda.empty_cache()
 
-            # Report detected language if auto was used
             if detected_language:
                 language_names = {
                     "en": "English",
@@ -509,10 +823,8 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
                 detected_name = language_names.get(detected_language, f"Unknown ({detected_language})")
                 print(f"[Whisper] Detected language: {detected_name}")
 
-            # Sort segments by start time
             all_segments.sort(key=lambda x: x["start"])
 
-            # Write combined SRT
             with open(srt_path, "w", encoding="utf-8") as f:
                 for i, segment in enumerate(all_segments):
                     start = format_timestamp(segment["start"])
@@ -523,6 +835,12 @@ def transcribe_video(video_path: str, model_size: str, language: str, transcript
         # Clean up
         if os.path.exists(audio_path):
             os.remove(audio_path)
+        trimmed_path = os.path.join(os.path.dirname(srt_path), "temp_audio_trimmed.wav")
+        if os.path.exists(trimmed_path):
+            try:
+                os.remove(trimmed_path)
+            except Exception:
+                pass
 
         # Final GPU cleanup
         if device == "cuda":
@@ -1196,11 +1514,24 @@ def main():
     # Whisper Settings
     parser.add_argument("--whisper-model", default="small", choices=["small", "medium", "large"])
     parser.add_argument("--language", default="auto", choices=["auto", "english", "japanese"])
+    parser.add_argument("--force-device", default="auto", choices=["auto", "cuda", "cpu"],
+                        help="Whisper device selection: 'auto' uses CUDA if available, 'cuda' forces CUDA, 'cpu' forces CPU.")
+
+    # Smart intro/outro detection
+    parser.add_argument("--smart-trim", action="store_true",
+                        help="Detect intro/outro and transcribe only the main content (timestamps stay aligned).")
+    parser.add_argument("--trim-method", default="inaspeech", choices=["inaspeech", "none"],
+                        help="Detection method for smart trim (optional dependency: inaSpeechSegmenter).")
+    parser.add_argument("--no-trim-cache", action="store_true",
+                        help="Disable caching of detected content ranges in workdir.")
+    parser.add_argument("--auto-skip-intro-outro", action="store_true",
+                        help="Exclude detected intro/outro from clip selection (does not modify video).")
 
     # Clip Settings
     parser.add_argument("--num-clips", type=int, default=5)
     parser.add_argument("--skip-intro", type=float, default=0)
     parser.add_argument("--skip-outro", type=float, default=0)
+    parser.add_argument("--skip-clips", type=int, default=0, help="Skip this many clips (for resuming)")
     parser.add_argument(
         "--target-length",
         type=int,
@@ -1251,10 +1582,30 @@ def main():
         args.template_style = "anime"
         args.overlay_font = "Noto Sans CJK JP"  # Better for Japanese text
 
-    # Auto-detect language from audio if set to auto
+    # Track a processing video (may be trimmed)
+    processing_video = args.video
+    processing_offset = 0.0
+
+    # If smart trim enabled, create/reuse a physically trimmed video early so ALL later stages use it.
+    if getattr(args, "smart_trim", False):
+        try:
+            processing_video, processing_offset, _ce, _sr, _mu = maybe_create_trimmed_video(
+                video_path=args.video,
+                workdir=args.workdir,
+                trim_method=args.trim_method,
+                cache=(not args.no_trim_cache),
+            )
+            if processing_video != args.video:
+                print(f"[Smart Trim] Processing video set to trimmed content: {processing_video}")
+        except Exception as e:
+            print(f"[Smart Trim] Failed to create trimmed processing video: {e}")
+            processing_video = args.video
+            processing_offset = 0.0
+
+    # Auto-detect language from audio if set to auto (use processing video for sampling)
     if args.language == "auto":
         print("Analyzing audio to detect language...")
-        detected_language = detect_audio_language(args.video)
+        detected_language = detect_audio_language(processing_video)
         if detected_language != "auto":
             args.language = detected_language
             print(f"Auto-detected language from audio: {args.language}")
@@ -1291,10 +1642,15 @@ def main():
 
                 # Transcribe the video
                 srt_file = transcribe_video(
-                    video_path=args.video,
+                    video_path=processing_video,
                     model_size=args.whisper_model,
                     language=args.language,
                     transcript_output=transcript_output,
+                    smart_trim=args.smart_trim,
+                    trim_method=args.trim_method,
+                    workdir=args.workdir,
+                    trim_cache=(not args.no_trim_cache),
+                    force_device=args.force_device,
                 )
 
                 print("Transcript saved to output directory")
@@ -1315,10 +1671,35 @@ def main():
             for i in range(min(args.num_clips * 3, int(duration // segment_duration)))
         ]
 
-    # Skip intro if specified
+    # Skip intro/outro if specified (manual)
     if args.skip_intro > 0:
         print(f"Skipping first {args.skip_intro} seconds (intro)")
         candidates = [c for c in candidates if c.start >= args.skip_intro]
+
+    if args.skip_outro > 0:
+        print(f"Skipping last {args.skip_outro} seconds (outro)")
+        vid_dur = get_video_duration(args.video)
+        if vid_dur > 0:
+            candidates = [c for c in candidates if c.end <= max(0.0, vid_dur - args.skip_outro)]
+
+    # Auto skip intro/outro from selection (optional)
+    auto_skip_ranges: List[Tuple[float, float]] = []
+    if args.auto_skip_intro_outro:
+        try:
+            content_start, content_end, skip_ranges, method_used = load_or_detect_content_range(
+                video_path=args.video,
+                workdir=args.workdir,
+                trim_method=args.trim_method,
+                pad_seconds=0.75,
+                cache=(not args.no_trim_cache),
+            )
+            auto_skip_ranges = skip_ranges
+            if auto_skip_ranges:
+                pretty = ", ".join([f"{format_timestamp(s)}->{format_timestamp(e)}" for s, e in auto_skip_ranges])
+                print(f"[Auto Skip] Excluding intro/outro ranges: {pretty} (method={method_used})")
+                candidates = apply_skip_ranges(candidates, auto_skip_ranges)
+        except Exception as e:
+            print(f"[Auto Skip] Failed to auto-detect intro/outro: {e}")
 
     # Improved Selection: merge into clip-sized chunks, then score
     print("Building candidate clips from subtitles...")
@@ -1349,16 +1730,69 @@ def main():
         merged_candidates = candidates
 
     # Ensure we have enough candidates (at least 3x requested clips)
-    if len(merged_candidates) < args.num_clips * 3:
-        print(f"Warning: Only found {len(merged_candidates)} candidate clips. Creating additional candidates...")
-        # Create more candidates by splitting existing ones or using time segments
-        segment_duration = int(target_clip_duration)
-        for i in range(args.num_clips * 3 - len(merged_candidates)):
-            start_time = i * segment_duration
-            if start_time + segment_duration < duration:
-                merged_candidates.append(
-                    Candidate(start_time, start_time + segment_duration, f"Additional clip {i + 1}")
-                )
+    if len(merged_candidates) < args.num_clips:
+        max_clips = len(merged_candidates)
+        total_possible_seconds = max_clips * float(target_clip_duration)
+        print("\n[!] Not enough candidate clips from transcript for the requested output.")
+        print(f"    Requested clips: {args.num_clips}")
+        print(f"    Candidate clips found: {max_clips}")
+        print(f"    Clip length (each): {float(target_clip_duration):.0f}s")
+        print(f"    Total possible output: ~{total_possible_seconds/60:.1f} minutes ({int(total_possible_seconds)}s)")
+        if auto_skip_ranges:
+            pretty = ", ".join([f"{format_timestamp(s)}->{format_timestamp(e)}" for s, e in auto_skip_ranges])
+            print(f"    Excluded ranges: {pretty}")
+
+        print("CLIPGEN_PREFLIGHT:" + json.dumps({
+            "reason": "insufficient_candidates",
+            "requested_clips": int(args.num_clips),
+            "max_clips": int(max_clips),
+            "clip_length_seconds": int(float(target_clip_duration)),
+            "total_possible_seconds": int(total_possible_seconds),
+            "excluded_ranges": [(float(s), float(e)) for s, e in (auto_skip_ranges or [])],
+        }))
+        print("\nPlease decrease the number of clips or reduce clip length.")
+        sys.exit(2)
+
+    # If you want more variety, reduce min_clip_len/max_clip_len settings.
+    # We intentionally DO NOT create synthetic time-based candidates here because
+    # they can include intros/outros and reduce quality.
+
+    # IMPORTANT: Enforce auto intro/outro skipping AFTER merge/filler creation too.
+    # (Filler candidates can accidentally land inside the detected outro.)
+    if auto_skip_ranges:
+        merged_candidates = apply_skip_ranges(
+            merged_candidates,
+            auto_skip_ranges,
+            overlap_ratio=0.0,          # hard exclusion
+            tiny_overlap_seconds=0.01,  # any overlap
+        )
+
+    # If we still don't have enough eligible candidates, abort and let the user decide.
+    # We do this BEFORE scoring/export so we never generate OP/ED clips as a fallback.
+    if len(merged_candidates) < args.num_clips:
+        max_clips = len(merged_candidates)
+        total_possible_seconds = max_clips * float(target_clip_duration)
+        print("\n[!] Not enough eligible clips after excluding intro/outro.")
+        print(f"    Requested clips: {args.num_clips}")
+        print(f"    Eligible clips found: {max_clips}")
+        print(f"    Clip length (each): {float(target_clip_duration):.0f}s")
+        print(f"    Total possible output: ~{total_possible_seconds/60:.1f} minutes ({int(total_possible_seconds)}s)")
+        if auto_skip_ranges:
+            pretty = ", ".join([f"{format_timestamp(s)}->{format_timestamp(e)}" for s, e in auto_skip_ranges])
+            print(f"    Excluded ranges: {pretty}")
+
+        # Machine-readable marker for the UI
+        print("CLIPGEN_PREFLIGHT:" + json.dumps({
+            "reason": "insufficient_candidates",
+            "requested_clips": int(args.num_clips),
+            "max_clips": int(max_clips),
+            "clip_length_seconds": int(float(target_clip_duration)),
+            "total_possible_seconds": int(total_possible_seconds),
+            "excluded_ranges": [(float(s), float(e)) for s, e in (auto_skip_ranges or [])],
+        }))
+
+        print("\nPlease decrease the number of clips (--num-clips) or disable auto skipping (--auto-skip-intro-outro).")
+        sys.exit(2)
 
     # Compute scores
     print(f"Scoring {len(merged_candidates)} candidate clips...")
@@ -1404,37 +1838,23 @@ def main():
             selected.append(cand)
             used_intervals.append((cand.start, cand.end))
 
-    # If we still need more clips, relax the overlap constraints
+    # If we still need more clips, DO NOT create synthetic clips that might violate skip ranges.
+    # Instead, stop and ask the user to reduce requested clip count.
     if len(selected) < num_clips_to_select:
-        print(f"First pass only selected {len(selected)} clips. Relaxing overlap constraints...")
-        for cand in merged_candidates:
-            if cand in selected:
-                continue
-            selected.append(cand)
-            used_intervals.append((cand.start, cand.end))
-            if len(selected) >= num_clips_to_select:
-                break
+        print("\n[!] Not enough non-overlapping clips to satisfy the requested count.")
+        print(f"    Requested clips: {num_clips_to_select}")
+        print(f"    Available after filtering: {len(selected)}")
 
-    # Final fallback - if still not enough clips, duplicate some existing clips from different parts
-    if len(selected) < num_clips_to_select:
-        print(f"Not enough unique clips. Creating additional clips...")
-        # If we have some selected clips, duplicate them with slight offsets
-        if selected:
-            clip_count = len(selected)
-            for i in range(num_clips_to_select - clip_count):
-                idx = i % clip_count
-                base_clip = selected[idx]
-                offset = 3.0  # Offset by 3 seconds
-                new_start = max(0, base_clip.start - offset)
-                new_end = min(duration, base_clip.end + offset)
-                selected.append(Candidate(new_start, new_end, f"{base_clip.text} (variant)"))
-        else:
-            # Last resort - create time-based clips
-            segment_duration = min(30, duration / num_clips_to_select)
-            for i in range(num_clips_to_select):
-                start_time = i * segment_duration
-                end_time = min(duration, start_time + segment_duration)
-                selected.append(Candidate(start_time, end_time, f"Segment {i + 1}"))
+        # Machine-readable marker for the UI
+        print("CLIPGEN_PREFLIGHT:" + json.dumps({
+            "reason": "insufficient_nonoverlapping",
+            "requested_clips": int(num_clips_to_select),
+            "max_clips": int(len(selected)),
+            "clip_length_seconds": int(float(target_clip_duration)),
+        }))
+
+        print("\nPlease decrease --num-clips or reduce --target-length to allow more candidates.")
+        sys.exit(2)
 
     # Limit to exactly the requested number of clips
     selected = selected[:num_clips_to_select]
@@ -1442,133 +1862,139 @@ def main():
     # Sort by timestamp for sequential output
     selected.sort(key=lambda c: c.start)
 
+    # Final hard enforcement before export (paranoia)
+    if auto_skip_ranges:
+        selected = apply_skip_ranges(selected, auto_skip_ranges, overlap_ratio=0.0, tiny_overlap_seconds=0.01)
+        if len(selected) < num_clips_to_select:
+            print("\n[!] Some selected clips overlapped excluded intro/outro ranges after final check.")
+            print(f"    Remaining eligible clips: {len(selected)}")
+            print("\nPlease decrease --num-clips or disable auto skipping.")
+            sys.exit(2)
+
     print(f"Selected exactly {len(selected)} clips for export.")
 
-    # 3. Export
-    tasks = []
+    # --- Export selected clips ---
+    # Respect resume: skip the first N selected clips
+    if getattr(args, "skip_clips", 0) and args.skip_clips > 0:
+        if args.skip_clips >= len(selected):
+            print(f"Nothing to do: --skip-clips={args.skip_clips} >= selected clips ({len(selected)}).")
+            return
+        print(f"Skipping first {args.skip_clips} clips (resume mode)")
+        selected = selected[args.skip_clips:]
+
+    # Parse target resolution
     try:
-        w, h = args.target_res.lower().split("x")
-        res = (int(w), int(h))
+        w_str, h_str = (args.target_res or "1080x1920").lower().split("x")
+        target_res = (int(w_str), int(h_str))
     except Exception:
-        res = (1080, 1920)
+        target_res = (1080, 1920)
 
-    for i, clip in enumerate(selected):
+    # Export sequentially (safe default)
+    for idx, clip in enumerate(selected, start=1 + int(getattr(args, "skip_clips", 0) or 0)):
+        orig_start = max(0.0, clip.start + float(processing_offset))
+        orig_end = max(0.0, clip.end + float(processing_offset))
+        out_name = f"{args.output_prefix}_clip_{idx:02d}_{format_timestamp(orig_start).replace(':','_').replace(',','_')}_{format_timestamp(orig_end).replace(':','_').replace(',','_')}.mp4"
+        out_path = os.path.join(args.outdir, out_name)
+
+        vf = build_filter_chain(clip, idx, args, target_res)
+
+        cmd = [
+            FFMPEG, "-y", "-hide_banner",
+            "-ss", str(max(0.0, clip.start)),
+            "-to", str(max(0.0, clip.end)),
+            "-i", processing_video,
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "20",
+            "-c:a", "aac",
+            "-b:a", "160k",
+            out_path,
+        ]
+
+        log_path = os.path.join(args.workdir, f"log_{args.output_prefix}_{idx}.txt")
         try:
-            # Create descriptive filename
-            clip_start_time = format_timestamp(clip.start).replace(':', '_').replace(',', '_')
-            out_name = f"{args.output_prefix}_clip_{i + 1:02d}_{clip_start_time}.mp4"
-            out_path = os.path.join(args.outdir, out_name)
-            log_path = os.path.join(args.workdir, f"log_{args.output_prefix}_{i + 1}.txt")
-
-            print(f"Building filter chain for clip {i + 1}/{len(selected)}...")
-            vf = build_filter_chain(clip, i + 1, args, res)
-
-            # Debug: print filter chain
-            print(f"  Filter: {vf[:100]}..." if len(vf) > 100 else f"  Filter: {vf}")
-
-            # Hardware Accel Check - Optimize for RTX 3060
-            v_codec = "libx264"
-            enc_opts = ["-preset", "fast", "-crf", "23"]
-
-            # For RTX 3060, use NVENC with optimized settings
-            if args.encoder == "nvenc" or (args.encoder == "auto" and shutil.which("nvidia-smi")):
-                v_codec = "h264_nvenc"
-                enc_opts = ["-preset", "p2", "-tune", "hq", "-cq", "23", "-b:v", "0"]
-
-            cmd = [
-                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", str(clip.start), "-t", str(clip.end - clip.start),
-                "-i", args.video, "-vf", vf,
-                "-c:v", v_codec, *enc_opts,
-                "-c:a", "aac", "-b:a", "192k",
-                out_path
-            ]
-            tasks.append((cmd, log_path))
+            run_ffmpeg(cmd, log_path=log_path)
+            print(f"Clip exported: {out_path}")
         except Exception as e:
-            print(f"ERROR: Failed to build task for clip {i + 1}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Failed to export clip {idx}: {e}")
 
-    # Parallel Export - Optimize for RTX 3060
-    if not tasks:
-        print("ERROR: No tasks were created. Check errors above.")
-        sys.exit(1)
 
-    print(f"Successfully created {len(tasks)} export tasks")
-    max_w = min(args.jobs, 3, os.cpu_count() or 2)
-    print(f"Exporting with {max_w} workers (optimized for RTX 3060)...")
+def _ffmpeg_stream_copy_trim(input_video: str, output_video: str, start: float, end: float) -> bool:
+    """Physically trim a video segment using stream copy (fast, minimal resources).
 
-    with ThreadPoolExecutor(max_workers=max_w) as exc:
-        futs = []
-        for cmd, log_path in tasks:
-            futs.append(exc.submit(run_ffmpeg, cmd, log_path))
-
-        for fut in as_completed(futs):
-            try:
-                fut.result()
-            except Exception as e:
-                # The detailed ffmpeg output is already written to the corresponding log file.
-                print(f"Export failed: {e}")
-
-    # Report what actually exists on disk (avoids as_completed ordering issues)
-    exported = [
-        fn for fn in os.listdir(args.outdir)
-        if fn.lower().endswith(".mp4") and "_clip_" in fn
-    ]
-    exported.sort()
-
-    if exported:
-        for fn in exported:
-            print(f"Exported: {fn}")
-    else:
-        print("WARNING: No .mp4 clip files found in output directory. Check the log_*.txt files in workdir for ffmpeg errors.")
-
-    # Calculate total output duration
-    total_duration = sum(c.end - c.start for c in selected)
-
-    # Create a summary file with clip information
-    summary_path = os.path.join(args.outdir, f"{args.output_prefix}_summary.txt")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(f"Video: {video_basename}\n")
-        f.write(f"Processed: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Transcript: {os.path.basename(srt_file)}\n")
-        f.write(f"Model: {args.whisper_model}\n")
-        f.write(f"Language: {args.language}\n")
-        f.write(f"Resolution: {args.target_res}\n")
-        f.write(f"Aspect Mode: {args.aspect_mode}\n")
-        f.write(f"Requested Clips: {num_clips_to_select}\n")
-        f.write(f"Generated Clips: {len(selected)}\n")
-        f.write(f"Clip Length (per clip): {args.target_length}s\n")
-        f.write(f"Total Duration: {total_duration:.1f} seconds ({total_duration / 60:.1f} minutes)\n\n")
-        f.write("Clips:\n")
-
-        for i, clip in enumerate(selected):
-            clip_duration = clip.end - clip.start
-            hook, punchline = get_hook_punchline(clip.text)
-            f.write(f"Clip {i + 1}:\n")
-            f.write(f"  Time: {format_timestamp(clip.start)} - {format_timestamp(clip.end)} ({clip_duration:.1f}s)\n")
-            f.write(f"  Hook: {hook}\n")
-            f.write(f"  Punchline: {punchline}\n")
-            f.write(f"  Full text: {clip.text[:100]}{'...' if len(clip.text) > 100 else ''}\n\n")
-
-    print(f"Processing complete. Output saved to: {args.outdir}")
-    print(f"Total video duration: {total_duration:.1f} seconds ({total_duration / 60:.1f} minutes)")
-    print(f"Summary file created: {summary_path}")
-
-    # Clean up any temporary text files that might have been created
-    for f_name in os.listdir(args.workdir):
-        if (f_name.startswith("t_") and f_name.endswith(".txt")) or \
-                (f_name.startswith("b_") and f_name.endswith(".txt")):
-            try:
-                os.remove(os.path.join(args.workdir, f_name))
-            except Exception:
-                pass
-
-if __name__ == "__main__":
-    # Ensure UTF-8 stdout
+    This removes OP/ED from the processing source entirely.
+    Note: stream copy is keyframe-limited, so cut points may snap to GOP boundaries.
+    """
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
-    except AttributeError:
-        # Fallback for older Python versions
-        pass
+        if end <= start:
+            return False
+        cmd = [
+            FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", str(max(0.0, float(start))),
+            "-to", str(max(0.0, float(end))),
+            "-i", input_video,
+            "-map", "0",
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            output_video,
+        ]
+        subprocess.run(cmd, check=True)
+        return os.path.exists(output_video) and os.path.getsize(output_video) > 0
+    except Exception as e:
+        print(f"[Smart Trim] ffmpeg stream-copy trim failed: {e}")
+        return False
+
+
+def get_video_duration_seconds_or_ffprobe(path: str) -> float:
+    """Best-effort duration for any media file."""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", path]
+        out = subprocess.check_output(cmd, universal_newlines=True).strip()
+        return float(out)
+    except Exception:
+        return get_video_duration(path)
+
+
+def maybe_create_trimmed_video(*, video_path: str, workdir: str, trim_method: str, cache: bool = True) -> Tuple[str, float, float, List[Tuple[float, float]], str]:
+    """Create/reuse a physically trimmed episode (intro/outro removed).
+
+    Returns:
+        (video_to_process, content_start, content_end, skip_ranges, method_used)
+
+    The trimmed video starts at time 0, but content_start is the offset in the ORIGINAL episode.
+    """
+    os.makedirs(workdir, exist_ok=True)
+    video_hash = get_video_hash(video_path)
+    trimmed_path = os.path.join(workdir, f"{video_hash}.content.mkv")
+
+    content_start, content_end, skip_ranges, method_used = load_or_detect_content_range(
+        video_path=video_path,
+        workdir=workdir,
+        trim_method=trim_method,
+        pad_seconds=0.75,
+        cache=cache,
+    )
+
+    duration = get_video_duration(video_path)
+    if duration <= 0:
+        duration = get_video_duration_seconds_or_ffprobe(video_path)
+
+    meaningful = (content_start > 5.0) or (duration > 0 and content_end < duration - 5.0)
+    if not meaningful or content_end <= content_start:
+        return video_path, 0.0, duration if duration > 0 else content_end, skip_ranges, method_used
+
+    if cache and os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 0:
+        return trimmed_path, float(content_start), float(content_end), skip_ranges, method_used
+
+    print(f"[Smart Trim] Creating trimmed processing video: {content_start:.1f}s -> {content_end:.1f}s")
+    if _ffmpeg_stream_copy_trim(video_path, trimmed_path, float(content_start), float(content_end)):
+        return trimmed_path, float(content_start), float(content_end), skip_ranges, method_used
+
+    return video_path, float(content_start), float(content_end), skip_ranges, method_used
+
+
+# Ensure script has an entrypoint
+if __name__ == "__main__":
     main()

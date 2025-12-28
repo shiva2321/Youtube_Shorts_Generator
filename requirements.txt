@@ -1,4 +1,18 @@
 faster-whisper>=1.1.0
 openai-whisper
-torch
 numpy
+
+# IMPORTANT (GPU): install a CUDA-enabled PyTorch build.
+# The plain 'torch' package often installs a CPU-only build on Windows.
+# Install one of these in your venv depending on your CUDA runtime support:
+#   pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+#   (or cu118 if needed: https://download.pytorch.org/whl/cu118)
+# If unsure, run: python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+
+# Optional (GPU accel for faster-whisper). If you use faster-whisper backend, this enables GPU execution via ONNX Runtime.
+onnxruntime-gpu
+
+# Optional (Smart intro/outro detection)
+inaSpeechSegmenter
+tensorflow
+

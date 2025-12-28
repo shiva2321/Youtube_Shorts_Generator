@@ -249,6 +249,47 @@ Clip 1:
 
 ---
 
+## ✂️ Smart Intro/Outro Detection (Beta)
+
+Some episodes place important scenes *before* the intro (cold open) or *after* the outro (post-credits), so a simple “skip first N seconds” can miss good moments.
+
+This project now supports a **smart intro/outro detector** that (when enabled):
+- **Avoids transcribing** the OP/ED to save Whisper time (`--smart-trim`)
+- **Avoids selecting/exporting clips** that overlap detected OP/ED ranges (`--auto-skip-intro-outro`)
+
+### Optional dependency (recommended)
+
+For best results, install `inaSpeechSegmenter` (it uses TensorFlow):
+
+```bash
+pip install inaSpeechSegmenter tensorflow
+```
+
+If it’s not installed, the app **falls back gracefully** and simply won’t skip anything.
+
+### CLI usage
+
+```bash
+python auto_important_clips.py \
+  --video "path/to/episode.mp4" \
+  --outdir "output/episode" \
+  --num-clips 5 \
+  --target-length 180 \
+  --smart-trim \
+  --auto-skip-intro-outro
+```
+
+Notes:
+- Timestamps in the generated transcript are still aligned to the **original video**.
+- You can still force manual skips with `--skip-intro` / `--skip-outro`.
+
+### UI
+
+In the **Input & Transcription** tab, enable:
+- **“Smartly remove intro/outro (Beta)”**
+
+---
+
 ## 📝 Examples
 
 ### Example 1: Quick TikTok Clips (15 seconds each)
