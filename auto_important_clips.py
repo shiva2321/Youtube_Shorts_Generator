@@ -11,6 +11,7 @@ import warnings
 import hashlib
 import time
 import unicodedata
+import random
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional
@@ -41,6 +42,10 @@ class OverlayTemplate:
     header_text: str = ""
     emoji_prefix: str = ""
     emoji_suffix: str = ""
+    # New: optional accent colors (ASS uses &HAABBGGRR)
+    top_text_color_ass: str = "&H00FFFFFF"     # white
+    bottom_text_color_ass: str = "&H00FFFFFF"  # white
+    bottom_accent_color_ass: str = "&H0033CCFF"  # orange-ish accent
 
 
 OVERLAY_TEMPLATES = {
@@ -112,8 +117,12 @@ OVERLAY_TEMPLATES = {
         border_width=4,
         show_branding=True,
         show_subscribe=True,
-        emoji_prefix="⭐ ",
-        emoji_suffix=" ⭐"
+        # Keep defaults but emojis will be chosen dynamically
+        emoji_prefix="",
+        emoji_suffix="",
+        top_text_color_ass="&H00FFFFFF",
+        bottom_text_color_ass="&H00FFFFFF",
+        bottom_accent_color_ass="&H0000CCFF"  # gold-ish
     ),
 }
 
@@ -697,29 +706,21 @@ def get_hook_punchline(text: str) -> Tuple[str, str]:
 # ==========================================
 
 def compute_heuristic_score(cand: Candidate, video_duration: Optional[float] = None) -> float:
-    """
-    Simple heuristic scoring:
-    - Boost questions/exclamations
-    - Penalize very short or very long segments
-    - Prefer segments away from intros/outros
-    """
+    """Heuristic scoring for candidate clips."""
     text = cand.text.strip()
     length = len(text)
     dur = max(0.1, cand.end - cand.start)
 
     score = 0.0
 
-    # Basic content features
     if "?" in text or "？" in text:
         score += 2.0
     if "!" in text or "！" in text:
         score += 1.5
 
-    # Numbers / "listicle" style
     if re.search(r"\b\d+\b", text):
         score += 0.8
 
-    # Some "interest" keywords (customizable)
     keywords = [
         "secret", "crazy", "insane", "best", "worst", "mistake", "tips",
         "how to", "you won't", "you will", "the reason", "truth", "behind",
@@ -730,7 +731,6 @@ def compute_heuristic_score(cand: Candidate, video_duration: Optional[float] = N
         if kw in lowered:
             score += 1.0
 
-    # Duration: prefer ~8–25s segments
     if dur < 5:
         score -= 1.0
     elif 5 <= dur <= 25:
@@ -738,18 +738,14 @@ def compute_heuristic_score(cand: Candidate, video_duration: Optional[float] = N
     elif dur > 45:
         score -= 0.8
 
-    # Penalize extremely short text
     if length < 15:
         score -= 0.8
 
-    # Position in video
     if video_duration:
         mid = (cand.start + cand.end) / 2
         rel = mid / video_duration
-        # lightly penalize first/last 5% unless very strong
         if rel < 0.05 or rel > 0.95:
             score -= 0.5
-        # central 20–80% gets small boost
         if 0.2 <= rel <= 0.8:
             score += 0.5
 
@@ -761,10 +757,7 @@ def merge_adjacent_candidates(
         max_clip_len: float = 60.0,
         min_clip_len: float = 8.0
 ) -> List[Candidate]:
-    """
-    Merge subtitle segments into more natural clip-sized chunks.
-    Tries to keep each clip between min_clip_len and max_clip_len seconds.
-    """
+    """Merge subtitle candidates into clip-sized chunks."""
     merged: List[Candidate] = []
     if not candidates:
         return merged
@@ -775,9 +768,6 @@ def merge_adjacent_candidates(
     text_parts: List[str] = []
 
     for cand in candidates:
-        cand_dur = cand.end - cand.start
-
-        # If no current chunk, start one
         if not current:
             current.append(cand)
             curr_start, curr_end = cand.start, cand.end
@@ -788,22 +778,19 @@ def merge_adjacent_candidates(
         tentative_dur = new_end - curr_start
 
         if tentative_dur <= max_clip_len:
-            # merge into current
             current.append(cand)
             curr_end = new_end
             text_parts.append(cand.text)
         else:
-            # finalize current
             combined_text = " ".join(text_parts).strip()
             dur = max(0.1, curr_end - curr_start)
             if dur >= min_clip_len:
                 merged.append(Candidate(curr_start, curr_end, combined_text))
-            # start new chunk
+
             current = [cand]
             curr_start, curr_end = cand.start, cand.end
             text_parts = [cand.text]
 
-    # finalize last chunk
     if current:
         combined_text = " ".join(text_parts).strip()
         dur = max(0.1, curr_end - curr_start)
@@ -818,27 +805,147 @@ def llm_score_candidate(
         clip_index: int,
         video_context: Optional[str] = None
 ) -> float:
-    """
-    OPTIONAL: Hook for scoring clips using an external LLM (local or remote).
-    By default, returns 0.0 (no contribution).
-
-    You can implement your own logic here, for example:
-    - call a local server (Ollama, LM Studio, etc.)
-    - call OpenAI / another API
-    - cache scores based on (start, end, text)
-
-    Return a score in range roughly [-3, +3] to combine with heuristic.
-    """
-    # Example pseudo-implementation (commented out):
-    # prompt = f"... use cand.text and maybe video_context ..."
-    # score = call_my_llm(prompt)
-    # return float(score)
+    """Optional scoring hook for external LLMs; default is no-op."""
     return 0.0
 
 
 # ==========================================
 # 5. FFmpeg Filter Construction
 # ==========================================
+
+# Overlay text helpers must be defined before build_filter_chain
+
+def _wrap_for_ass(text: str, max_chars_per_line: int, max_lines: int) -> str:
+    """Wrap text for ASS subtitles using '\\N' line breaks.
+
+    Notes:
+    - This wrapper is meant for plain text. If the string contains ASS override tags ("{...}"),
+      we skip wrapping to avoid breaking tags.
+    """
+    if not text:
+        return ""
+
+    # Don't attempt to wrap ASS override-tagged text.
+    if "{" in text and "}" in text:
+        return re.sub(r"\s+", " ", text).strip()
+
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if not text:
+        return ""
+
+    words = text.split(" ")
+    lines: List[str] = []
+    cur: List[str] = []
+    cur_len = 0
+
+    for w in words:
+        add_len = len(w) + (1 if cur else 0)
+        if cur and (cur_len + add_len) > max_chars_per_line:
+            lines.append(" ".join(cur))
+            cur = [w]
+            cur_len = len(w)
+        else:
+            cur.append(w)
+            cur_len += add_len
+
+        if len(lines) >= max_lines:
+            break
+
+    if len(lines) < max_lines and cur:
+        lines.append(" ".join(cur))
+
+    lines = lines[:max_lines]
+
+    if lines:
+        last = lines[-1]
+        if len(last) > max_chars_per_line:
+            lines[-1] = last[: max(0, max_chars_per_line - 3)].rstrip() + "..."
+
+    return "\\N".join(lines)
+
+
+def _pick_catchy_hook(_: str, rnd: random.Random) -> str:
+    """Pick a short, catchy hook with emojis."""
+    presets = [
+        "Wait for it…",
+        "WTH?!",
+        "I wasn't expecting that…",
+        "You won't believe this…",
+        "This changes EVERYTHING…",
+        "Bro… what?!",
+        "Hold up…",
+        "No way…",
+        "Plot twist…",
+        "This part is INSANE…",
+        "Watch till the end…",
+    ]
+    emojis = ["🔥", "😳", "👀", "🤯", "💀", "⚡", "⭐"]
+    base = presets[rnd.randrange(len(presets))]
+    emo = emojis[rnd.randrange(len(emojis))]
+    return f"{emo} {base} {emo}"
+
+
+def _pick_top_emojis_for_text(text: str, rnd: random.Random, max_emojis: int = 2) -> List[str]:
+    """Pick context-aware emojis for top hooks (keeps it varied per clip)."""
+    t = (text or "").lower()
+
+    # Keyword buckets
+    buckets: List[Tuple[List[str], List[str]]] = [
+        (["fight", "attack", "kill", "battle", "jutsu", "punch", "hit"], ["⚔️", "🔥", "💥", "⚡"]),
+        (["run", "chase", "escape", "hurry"], ["🏃", "💨", "⏳"]),
+        (["secret", "plan", "trap", "behind", "truth"], ["🕵️", "🔍", "🤫", "🧠"]),
+        (["shocked", "what", "wth", "no way", "seriously"], ["😳", "🤯", "😱"]),
+        (["funny", "lol", "idiot", "stupid"], ["😂", "🤣", "💀"]),
+        (["sad", "cry", "sorry", "hurt"], ["🥺", "😢", "💔"]),
+    ]
+
+    pool: List[str] = []
+    for keys, emos in buckets:
+        if any(k in t for k in keys):
+            pool.extend(emos)
+
+    # Default variety for anime clips
+    if not pool:
+        pool = ["⭐", "🔥", "😳", "👀", "🤯", "⚡"]
+
+    # Dedup while keeping order
+    seen = set()
+    uniq = []
+    for e in pool:
+        if e not in seen:
+            seen.add(e)
+            uniq.append(e)
+
+    rnd.shuffle(uniq)
+    return uniq[:max_emojis]
+
+
+def _style_bottom_text_ass(text: str, tpl: OverlayTemplate) -> str:
+    """Add ASS color styling for common CTAs without changing actual text.
+
+    Important: this must run AFTER shortening/wrapping, otherwise we might truncate ASS tags.
+    """
+    raw = (text or "").strip()
+    low = raw.lower()
+
+    # Subscribe CTA: color the word and also color the @handle slightly
+    if low.startswith("subscribe"):
+        rest = raw[len("subscribe"):]
+        # Color @handle (if present)
+        rest = re.sub(
+            r"(@\w+)",
+            lambda m: f"{{\\c{tpl.bottom_accent_color_ass}}}{m.group(1)}{{\\c{tpl.bottom_text_color_ass}}}",
+            rest,
+        )
+        return f"{{\\c{tpl.bottom_accent_color_ass}}}Subscribe{{\\c{tpl.bottom_text_color_ass}}}{rest}"
+
+    # Like CTA
+    if low.startswith("like"):
+        rest = raw[len("like"):]
+        return f"{{\\c{tpl.bottom_accent_color_ass}}}Like{{\\c{tpl.bottom_text_color_ass}}}{rest}"
+
+    return raw
+
 
 def build_filter_chain(clip: Candidate, idx: int, cfg: argparse.Namespace, resolution: Tuple[int, int]) -> str:
     target_w, target_h = resolution
@@ -895,6 +1002,12 @@ def build_filter_chain(clip: Candidate, idx: int, cfg: argparse.Namespace, resol
                 i=idx,
             )
 
+            # If enabled, override top text with catchy preset hook (keeps current functionality by default)
+            if getattr(cfg, "catchy_hooks", False):
+                seed = int(getattr(cfg, "hook_seed", 0) or 0)
+                rnd = random.Random(seed + idx)
+                top_txt = _pick_catchy_hook(clip.text, rnd)
+
             # Bottom text: prefer subscribe CTA if we have channel
             if cfg.channel_name and tpl.show_subscribe:
                 bottom_default = f"Subscribe {cfg.channel_name}"
@@ -944,9 +1057,42 @@ def build_filter_chain(clip: Candidate, idx: int, cfg: argparse.Namespace, resol
                     t = truncated + "..."
             return t
 
-        # Use stricter length limits
         top_txt = shorten_for_overlay(top_txt, 80)
         bot_txt = shorten_for_overlay(bot_txt, 60)
+
+        # For anime template, force a clean CTA so it never gets truncated into "Subsc..."
+        if tpl.name == "anime" and cfg.channel_name and tpl.show_subscribe:
+            # Keep it short but complete.
+            bot_txt = f"Subscribe {cfg.channel_name}"
+
+        # ASS safety: text must not contain raw newlines or carriage returns.
+        top_txt = (top_txt or "").replace("\r", " ").replace("\n", " ")
+        bot_txt = (bot_txt or "").replace("\r", " ").replace("\n", " ")
+
+        # --- Hard wrap so it never exits the frame ---
+        # For vertical 1080x1920, 18–22 chars per line is safe in the top bar at typical font sizes.
+        is_vertical = target_h > target_w
+        max_chars_per_line = 22 if is_vertical else 34
+        top_txt = _wrap_for_ass(top_txt, max_chars_per_line=max_chars_per_line, max_lines=2)
+        bot_txt = _wrap_for_ass(bot_txt, max_chars_per_line=max_chars_per_line, max_lines=1)
+
+        # If anime template, put varied, context-aware emojis around the top text
+        if tpl.name == "anime":
+            rnd = random.Random(int(getattr(cfg, "hook_seed", 0) or 0) + idx)
+            emos = _pick_top_emojis_for_text(f"{hook} {punchline} {clip.text}", rnd, max_emojis=2)
+            if emos:
+                top_txt = f"{emos[0]} {top_txt}"
+                if len(emos) > 1:
+                    top_txt = f"{top_txt} {emos[1]}"
+            top_txt = _wrap_for_ass(top_txt, max_chars_per_line=max_chars_per_line, max_lines=2)
+
+        # Style bottom CTA (subscribe/like) with accent colors (ASS override tags)
+        if tpl.name == "anime":
+            bot_txt = _style_bottom_text_ass(bot_txt, tpl)
+
+        # Remove accidental trailing ASS linebreaks (looks like an empty line)
+        top_txt = (top_txt or "").rstrip("\\N")
+        bot_txt = (bot_txt or "").rstrip("\\N")
 
         # Calculate font size BEFORE creating overlay assets
         is_vertical = target_h > target_w
@@ -989,14 +1135,19 @@ def build_filter_chain(clip: Candidate, idx: int, cfg: argparse.Namespace, resol
                 f.write('WrapStyle: 2\n')
                 f.write('ScaledBorderAndShadow: yes\n\n')
 
+                # Use template-provided colors
+                top_primary = getattr(tpl, "top_text_color_ass", "&H00FFFFFF")
+                bottom_primary = getattr(tpl, "bottom_text_color_ass", "&H00FFFFFF")
+
                 f.write('[V4+ Styles]\n')
                 f.write('Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n')
                 # Alignment 8 = top center; 2 = bottom center
-                f.write(f'Style: Top,Arial,{fs_base},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,2,8,30,30,{top_y_pos},1\n')
-                f.write(f'Style: Bottom,Arial,{int(fs_base * 0.9)},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,2,2,30,30,{target_h - bottom_y_pos},1\n\n')
+                f.write(f'Style: Top,Arial,{fs_base},{top_primary},&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,2,8,30,30,{top_y_pos},1\n')
+                f.write(f'Style: Bottom,Arial,{int(fs_base * 0.9)},{bottom_primary},&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,2,2,30,30,{target_h - bottom_y_pos},1\n\n')
 
                 f.write('[Events]\n')
                 f.write('Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n')
+                # Do NOT append an extra \\N at end; it can create an empty line and looks odd.
                 f.write(f'Dialogue: 0,0:00:00.00,9:59:59.99,Top,,0,0,0,,{top_txt}\n')
                 f.write(f'Dialogue: 0,0:00:00.00,9:59:59.99,Bottom,,0,0,0,,{bot_txt}\n')
 
@@ -1016,31 +1167,21 @@ def build_filter_chain(clip: Candidate, idx: int, cfg: argparse.Namespace, resol
 
 
 # ==========================================
-# 6. Main Logic
+# 6. Export Task Execution
 # ==========================================
 
-def run_ffmpeg(args):
-    cmd, log = args
+def run_ffmpeg(command: List[str], log_path: Optional[str] = None):
+    """Run an FFmpeg command with error handling and optional log capture."""
     try:
-        with open(log, "w", encoding='utf-8') as f:
-            result = subprocess.run(cmd, stdout=f, stderr=f, check=False)
-
-        # Check if FFmpeg actually succeeded
-        if result.returncode != 0:
-            with open(log, "r", encoding='utf-8') as f:
-                error_content = f.read()
-            raise RuntimeError(f"FFmpeg failed with return code {result.returncode}. Check log for details")
-
-        # Verify the output file was actually created
-        output_file = cmd[-1]
-        if not os.path.exists(output_file):
-            with open(log, "r", encoding='utf-8') as f:
-                error_content = f.read()
-            raise RuntimeError(f"FFmpeg completed but output file not created: {output_file}")
-
-        return True
-    except Exception as e:
-        raise RuntimeError(f"FFmpeg error: {e}")
+        if log_path:
+            # Ensure parent exists
+            os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+            with open(log_path, "w", encoding="utf-8", errors="ignore") as lf:
+                subprocess.run(command, check=True, stdout=lf, stderr=lf)
+        else:
+            subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"FFmpeg error: returncode={e.returncode}")
 
 
 def main():
@@ -1080,6 +1221,8 @@ def main():
     parser.add_argument("--overlay-top-text", default="{hook}")
     parser.add_argument("--overlay-bottom-text", default="{punchline}")
     parser.add_argument("--overlay-backend", default="ass", choices=["ass", "png"], help="Overlay backend: 'ass' (libass) or 'png' (Pillow rendered).")
+    parser.add_argument("--catchy-hooks", action="store_true", help="Use short, catchy preset top hooks with emojis.")
+    parser.add_argument("--hook-seed", type=int, default=0, help="Seed for deterministic hook selection.")
 
     args = parser.parse_args()
 
@@ -1356,22 +1499,29 @@ def main():
     print(f"Exporting with {max_w} workers (optimized for RTX 3060)...")
 
     with ThreadPoolExecutor(max_workers=max_w) as exc:
-        futs = [exc.submit(run_ffmpeg, t) for t in tasks]
-        for i, f in enumerate(as_completed(futs)):
+        futs = []
+        for cmd, log_path in tasks:
+            futs.append(exc.submit(run_ffmpeg, cmd, log_path))
+
+        for fut in as_completed(futs):
             try:
-                f.result()
-                print(f"Clip {i + 1}/{len(tasks)} exported: {os.path.basename(tasks[i][0][-1])}")
+                fut.result()
             except Exception as e:
-                print(f"Export failed for clip {i + 1}: {e}")
-                log_file = tasks[i][1]
-                if os.path.exists(log_file):
-                    try:
-                        with open(log_file, 'r', encoding='utf-8', errors='ignore') as lf:
-                            error_log = lf.read()
-                            if error_log:
-                                print(f"  FFmpeg error output:\n{error_log[:500]}")
-                    except Exception:
-                        pass
+                # The detailed ffmpeg output is already written to the corresponding log file.
+                print(f"Export failed: {e}")
+
+    # Report what actually exists on disk (avoids as_completed ordering issues)
+    exported = [
+        fn for fn in os.listdir(args.outdir)
+        if fn.lower().endswith(".mp4") and "_clip_" in fn
+    ]
+    exported.sort()
+
+    if exported:
+        for fn in exported:
+            print(f"Exported: {fn}")
+    else:
+        print("WARNING: No .mp4 clip files found in output directory. Check the log_*.txt files in workdir for ffmpeg errors.")
 
     # Calculate total output duration
     total_duration = sum(c.end - c.start for c in selected)
