@@ -1,2131 +1,974 @@
 import argparse
-import json
 import os
 import re
 import subprocess
 import sys
-import time
 import textwrap
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+import platform
+import shutil
+import datetime
+import warnings
+import hashlib
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple, Optional
+
+# Suppress FP16 warnings on CPU
+warnings.filterwarnings("ignore")
 
 
-# Ensure console output is UTF-8 so emoji-sourced log lines no longer trigger Windows codepage errors.
-try:
-  sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-  sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except AttributeError:
-  pass
+# ==========================================
+# 1. Configuration & Data Structures
+# ==========================================
 
-# Make sure child-process output decoded by Python uses UTF-8 where possible.
-os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-
-
-# ----------------------------
-# Portable tool discovery (no hard-coded paths)
-# ----------------------------
-def _which(cmd: str) -> Optional[str]:
-  from shutil import which
-
-  return which(cmd)
-
-
-def _env_path(name: str) -> Optional[str]:
-  v = (os.environ.get(name) or "").strip().strip('"')
-  return v or None
-
-
-def resolve_exe(
-    *,
-    env_var: str,
-    default_names: List[str],
-    label: str,
-    extra_candidates: Optional[List[str]] = None,
-) -> str:
-  """Resolve an executable path.
-
-  Priority:
-    1) explicit env var path
-    2) PATH lookup (shutil.which)
-    3) optional additional candidate paths
-  """
-  p = _env_path(env_var)
-  if p:
-    if os.path.exists(p):
-      return p
-    raise FileNotFoundError(f"{label} from ${env_var} not found: {p}")
-
-  for nm in default_names:
-    hit = _which(nm)
-    if hit:
-      return hit
-
-  for cand in (extra_candidates or []):
-    if cand and os.path.exists(cand):
-      return cand
-
-  raise FileNotFoundError(
-    f"{label} not found. Set {env_var} to the full path, or install it and make it available on PATH."
-  )
-
-
-def resolve_file(*, env_var: str, default_path: Optional[str], label: str) -> str:
-  p = _env_path(env_var) or (default_path.strip() if default_path else None)
-  if not p:
-    raise FileNotFoundError(f"{label} not configured. Set {env_var} to the full path.")
-  if not os.path.exists(p):
-    raise FileNotFoundError(f"{label} not found: {p}")
-  return p
-
-
-def _common_ffmpeg_candidates() -> List[str]:
-  """A few common Windows installs (best effort; safe if missing)."""
-  cands: List[str] = []
-  lad = os.environ.get("LOCALAPPDATA")
-  if lad:
-    cands.append(os.path.join(lad, "Microsoft", "WinGet", "Packages"))
-  # Donâ€™t walk directories here (too slow). Just keep this minimal.
-  return []
-
-
-# ----------------------------
-# Tool paths (resolved at runtime)
-# ----------------------------
-# Env vars supported:
-#  - ANIMECLIPS_FFMPEG
-#  - ANIMECLIPS_FFPROBE
-#  - ANIMECLIPS_WHISPER_CLI
-#  - ANIMECLIPS_WHISPER_MODEL
-#  - ANIMECLIPS_WHISPER_VAD_MODEL
-
-# NOTE: We resolve these in main() so importing this module never fails.
-FFMPEG = "ffmpeg"
-FFPROBE = "ffprobe"
-
-# whisper.cpp is optional if you use faster-whisper. Resolve lazily when used.
-WHISPER_CLI = _env_path("ANIMECLIPS_WHISPER_CLI")
-WHISPER_MODEL = _env_path("ANIMECLIPS_WHISPER_MODEL")
-WHISPER_VAD_MODEL = _env_path("ANIMECLIPS_WHISPER_VAD_MODEL")
-
-
-# ----------------------------
-# Data structures
-# ----------------------------
 @dataclass
-class Segment:
-  start: float
-  end: float
-  text: str
+class OverlayTemplate:
+    """Configuration for overlay styles."""
+    name: str
+    top_bar_color: str = "black"
+    bottom_bar_color: str = "black"
+    top_bar_opacity: float = 1.0
+    bottom_bar_opacity: float = 0.9
+    use_gradient: bool = False
+    gradient_colors: List[str] = field(default_factory=lambda: ["#000000", "#000000"])
+    text_style: str = "outline"  # "outline", "shadow", "glow"
+    text_color: str = "white"
+    border_width: int = 3
+    show_branding: bool = False
+    show_subscribe: bool = False
+    header_text: str = ""
+    emoji_prefix: str = ""
+    emoji_suffix: str = ""
+
+
+OVERLAY_TEMPLATES = {
+    "simple": OverlayTemplate(name="simple", top_bar_opacity=0.8, bottom_bar_opacity=0.8, text_style="shadow"),
+    "viral_shorts": OverlayTemplate(name="viral_shorts", header_text="LIKE & SUBSCRIBE", show_branding=True,
+                                    show_subscribe=True, use_gradient=True, gradient_colors=["#0066ff", "#0044aa"],
+                                    text_style="outline", border_width=4, emoji_prefix="🔥 ", emoji_suffix=" 👀"),
+    "neon_vibes": OverlayTemplate(name="neon_vibes", use_gradient=True, gradient_colors=["#ff00cc", "#333399"],
+                                  text_style="glow", show_branding=True, emoji_prefix="✨ ", emoji_suffix=" ✨"),
+    "glass_modern": OverlayTemplate(name="glass_modern", top_bar_color="black", bottom_bar_color="black",
+                                    top_bar_opacity=0.4, bottom_bar_opacity=0.4, text_style="shadow", border_width=2,
+                                    show_branding=True, emoji_prefix="👉 ", emoji_suffix=" 👈"),
+    "cinematic": OverlayTemplate(name="cinematic", top_bar_color="black", bottom_bar_color="black", top_bar_opacity=1.0,
+                                 bottom_bar_opacity=1.0, text_style="shadow", text_color="#f0f0f0",
+                                 emoji_prefix="", emoji_suffix=""),
+    "anime": OverlayTemplate(name="anime", top_bar_color="#0066cc", bottom_bar_color="#0066cc",
+                             top_bar_opacity=0.85, bottom_bar_opacity=0.85, text_style="outline",
+                             text_color="#ffffff", border_width=4, emoji_prefix="⭐ ", emoji_suffix=" ⭐"),
+}
 
 
 @dataclass
 class Candidate:
-  start: float
-  end: float
-  text: str
-  score: float = 0.0
+    start: float
+    end: float
+    text: str
+    score: float = 0.0
 
 
-@dataclass
-class ASRConfig:
-  backend: str = "auto"          # auto|whispercpp|faster-whisper
-  model: str = "small"           # faster-whisper model name
-  device: str = "auto"           # auto|cpu|cuda
-  compute_type: str = "auto"     # auto|float16|int8|...
-  threads: int = 6               # whisper.cpp threads
+# ==========================================
+# 2. Whisper Transcription Integration
+# ==========================================
+
+def format_timestamp(seconds: float) -> str:
+    """Converts seconds to SRT timestamp format (HH:MM:SS,mmm)."""
+    td = datetime.timedelta(seconds=seconds)
+    total_seconds = int(td.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-# ----------------------------
-# Subprocess helpers (NO shell=True; Windows-safe)
-# ----------------------------
-def run_capture(args: List[str]) -> str:
-  print("RUN:", " ".join(_pretty_args(args)))
-  p = subprocess.run(args, check=True, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-  # Some ffmpeg/ffprobe info comes on stderr; callers pass args accordingly.
-  return (p.stdout or "") + (p.stderr or "")
-
-
-def run(args: List[str]) -> None:
-  print("RUN:", " ".join(_pretty_args(args)))
-  subprocess.run(args, check=True)
-
-
-def _safe_display(s: str) -> str:
-  """Best-effort safe string for console output on Windows codepages."""
-  try:
-    return s.encode("utf-8", "backslashreplace").decode("utf-8")
-  except Exception:
+def get_video_duration(video_path: str) -> float:
+    """Get the duration of a video file using FFmpeg."""
     try:
-      return s.encode("ascii", "backslashreplace").decode("ascii")
-    except Exception:
-      return str(s)
-
-
-def _pretty_args(args: List[str]) -> List[str]:
-  out: List[str] = []
-  for a in args:
-    a = "" if a is None else str(a)
-    a = _safe_display(a)
-    if not a:
-      out.append('""')
-    elif any(c.isspace() for c in a) or "'" in a or '"' in a:
-      out.append('"' + a.replace('"', '\\"') + '"')
-    else:
-      out.append(a)
-  return out
-
-
-def _vf_escape_path(p: str) -> str:
-  """Escape a filesystem path for ffmpeg filter args (drawtext textfile/fontfile).
-
-  For filter arguments, ':' is a key/value delimiter, so Windows drive letters must be escaped.
-  Also escape backslashes and single-quotes, and keep forward slashes.
-  """
-  p = os.path.abspath(p)
-  p = p.replace("\\", "/")
-  # escape for ffmpeg option parsing inside filter definitions
-  p = p.replace("'", "\\'")
-  p = p.replace(":", "\\:")
-  return p
-
-
-def _write_textfile_utf8(path: str, text: str) -> str:
-  os.makedirs(os.path.dirname(path), exist_ok=True)
-  with open(path, "w", encoding="utf-8", newline="\n") as f:
-    f.write((text or "").strip() + "\n")
-  return path
-
-
-def _overlay_should_apply(*, aspect: str, mode: str, overlay_mode: str) -> bool:
-  if overlay_mode == "off":
-    return False
-  if overlay_mode == "on":
-    return True
-  # auto -> only for padded outputs: aspect is 9:16 and using fit/smart (pad path)
-  return aspect == "9:16" and mode in ("fit", "smart")
-
-
-def _wrap_overlay_text(text: str, *, max_chars: int, max_lines: int) -> str:
-  """Word-wrap overlay text into multiple lines.
-
-  This keeps overlays readable on vertical video: we hard-wrap by
-  character count so drawtext can render multi-line text from a
-  textfile, since ffmpeg does not auto-wrap.
-  """
-  if not text:
-    return ""
-  text = re.sub(r"\s+", " ", text.strip())
-  if not text:
-    return ""
-  # Basic greedy word wrap.
-  wrapper = textwrap.TextWrapper(width=max_chars, break_long_words=True, break_on_hyphens=True)
-  lines = wrapper.wrap(text)
-  if not lines:
-    return ""
-  if len(lines) > max_lines:
-    lines = lines[:max_lines]
-    # Indicate truncation a bit.
-    if not lines[-1].endswith("â€¦") and not lines[-1].endswith("..."):
-      if len(lines[-1]) >= 3:
-        lines[-1] = lines[-1][:-3] + "..."
-      else:
-        lines[-1] = lines[-1] + "..."
-  return "\n".join(lines)
-
-
-def _extract_sentences(text: str) -> List[str]:
-  """Split text into sentences, preserving sentence structure."""
-  if not text:
-    return []
-  # Basic sentence splitting on . ! ?
-  sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-  return [s.strip() for s in sentences if s.strip()]
-
-
-def _is_engaging_sentence(sentence: str) -> bool:
-  """Heuristic to detect engaging/punchline-worthy sentences."""
-  if not sentence or len(sentence) < 5:
-    return False
-
-  # Check for engagement markers
-  engagement_words = [
-    'wow', 'crazy', 'amazing', 'insane', 'incredible', 'unbelievable',
-    'what', 'how', 'why', 'never', 'always', 'must', 'don\'t', 'can\'t',
-    'wait', 'watch', 'look', 'see', 'hear', 'remember', 'think', 'know',
-    'best', 'worst', 'better', 'worse', 'great', 'terrible', 'awesome',
-    'epic', 'legendary', 'insane', 'shocked', 'surprised', 'shocked',
-    'laugh', 'joke', 'funny', 'hilarious', 'ridiculous', 'absurd'
-  ]
-
-  sentence_lower = sentence.lower()
-  engagement_score = sum(1 for word in engagement_words if f' {word} ' in f' {sentence_lower} ')
-
-  # Exclamation marks and questions are good indicators
-  if '!' in sentence or ('?' in sentence and len(sentence) < 50):
-    engagement_score += 2
-
-  return engagement_score > 0
-
-
-def _extract_hook(text: str) -> str:
-  """Extract an engaging hook from clip text.
-
-  Strategy:
-  1. Look for short questions (best hooks)
-  2. Look for exclamations
-  3. Look for commands/imperatives
-  4. Fall back to first sentence
-  """
-  if not text:
-    return "Amazing moment!"
-
-  sentences = _extract_sentences(text)
-  if not sentences:
-    return "Amazing moment!"
-
-  # Priority 1: Short questions (questions are great hooks!)
-  for sent in sentences[:min(8, len(sentences))]:
-    if '?' in sent and len(sent) <= 40:
-      return sent.rstrip('?').strip()
-
-  # Priority 2: Exclamations or imperatives
-  for sent in sentences[:min(6, len(sentences))]:
-    if '!' in sent and len(sent) <= 35:
-      return sent.rstrip('!').strip()
-    # Look for imperatives (commands)
-    if sent.lower().startswith(('wait', 'watch', 'look', 'listen', 'come', 'hurry', 'go', 'try', 'stop', 'check')):
-      if len(sent) <= 35:
-        return sent.rstrip('!.?').strip()
-
-  # Priority 3: Shocking words
-  shock_words = ['what', 'how', 'never', 'impossible', 'unbelievable', 'crazy', 'insane', 'incredible']
-  for sent in sentences[:min(6, len(sentences))]:
-    if any(word in sent.lower() for word in shock_words) and len(sent) <= 40:
-      return sent.rstrip('!.?').strip()
-
-  # Priority 4: First sentence (usually good)
-  first = sentences[0].strip().rstrip('!.?')
-  if len(first) <= 40:
-    return first
-
-  # Priority 5: Shorten and use first sentence
-  words = first.split()
-  if len(words) > 8:
-    return ' '.join(words[:8])
-
-  return first[:40] if len(first) > 40 else first
-
-
-def _extract_punchline(text: str) -> str:
-  """Extract a punchline/payoff moment from clip text.
-
-  Strategy:
-  1. Look for answers to questions
-  2. Look for the last interesting statement
-  3. Look for strong conclusion statements
-  4. Fall back to middle/end of text
-  """
-  if not text:
-    return "Epic scene incoming"
-
-  sentences = _extract_sentences(text)
-  if not sentences:
-    words = text.split()
-    snippet = ' '.join(words[min(10, len(words)-5):min(20, len(words))])
-    return snippet if len(snippet) <= 50 else snippet[:47]
-
-  # Priority 1: Find answers to questions
-  for i in range(len(sentences) - 1):
-    if '?' in sentences[i]:
-      answer = sentences[i+1].strip().rstrip('!.?')
-      if 15 <= len(answer) <= 55:
-        return answer
-      if len(answer) > 55:
-        words = answer.split()
-        return ' '.join(words[:min(12, len(words))])
-
-  # Priority 2: Look for last few sentences with strong words
-  strong_words = ['will', 'must', 'should', 'can\'t', 'won\'t', 'never', 'always', 'have', 'remember', 'know', 'believe']
-  for sent in reversed(sentences[-5:]):
-    sent_clean = sent.rstrip('!.?').strip()
-    if any(word in sent_clean.lower() for word in strong_words) and 15 <= len(sent_clean) <= 55:
-      return sent_clean
-
-  # Priority 3: Last non-empty sentence if reasonable length
-  if len(sentences) >= 2:
-    last = sentences[-1].rstrip('!.?').strip()
-    if 15 <= len(last) <= 55:
-      return last
-    if len(last) > 55:
-      words = last.split()
-      return ' '.join(words[:min(12, len(words))])
-
-  # Priority 4: Get middle/end segment
-  mid_idx = max(1, len(sentences) // 2)
-  for j in range(len(sentences) - 1, max(mid_idx - 2, -1), -1):
-    sent_clean = sentences[j].rstrip('!.?').strip()
-    if 15 <= len(sent_clean) <= 55:
-      return sent_clean
-
-  # Priority 5: Last resort - combine last few words
-  words = text.split()
-  if len(words) > 20:
-    # Get from middle onwards
-    start = max(0, len(words) - 20)
-    snippet = ' '.join(words[start:start+12])
-  else:
-    snippet = ' '.join(words[-min(12, len(words)):])
-
-  return snippet if len(snippet) <= 55 else snippet[:52]
-
-
-def _call_ollama_generate(prompt: str, max_tokens: int = 100) -> str:
-  """Call Ollama to generate smart text using a small model.
-
-  Falls back gracefully if Ollama is not available.
-  """
-  try:
-    import subprocess
-    import json
-
-    # Try to use ollama with mistral or similar small model
-    result = subprocess.run(
-      ["ollama", "run", "mistral", prompt],
-      capture_output=True,
-      text=True,
-      timeout=5
-    )
-
-    if result.returncode == 0:
-      return result.stdout.strip()
-  except Exception:
-    pass
-
-  return None
-
-
-def _generate_smart_hook_ollama(transcript: str, fallback_hook: str) -> str:
-  """Use Ollama to generate a smart hook if available, else use fallback."""
-  if not transcript:
-    return fallback_hook
-
-  # Truncate transcript to reasonable length for Ollama
-  transcript_short = transcript[:300]
-
-  prompt = f"""Based on this anime scene transcript, write a SHORT (max 5 words) punchy hook that makes viewers want to watch.
-
-Transcript: "{transcript_short}"
-
-Hook (SHORT and punchy):"""
-
-  result = _call_ollama_generate(prompt, max_tokens=20)
-  if result:
-    # Clean up the result
-    result = result.strip().rstrip('.!?')[:30]
-    return result if result else fallback_hook
-
-  return fallback_hook
-
-
-def _generate_smart_punchline_ollama(transcript: str, fallback_punchline: str) -> str:
-  """Use Ollama to generate a smart punchline if available, else use fallback."""
-  if not transcript:
-    return fallback_punchline
-
-  # Truncate transcript to reasonable length
-  transcript_short = transcript[:300]
-
-  prompt = f"""Based on this anime scene transcript, write a SHORT (max 10 words) punchline that captures the cool/funny/shocking moment.
-
-Transcript: "{transcript_short}"
-
-Punchline (SHORT and impactful):"""
-
-  result = _call_ollama_generate(prompt, max_tokens=30)
-  if result:
-    # Clean up the result
-    result = result.strip().rstrip('.!?')[:50]
-    return result if result else fallback_punchline
-
-  return fallback_punchline
-
-
-
-
-def build_overlay_vf(
-    *,
-    clip_index: int,
-    clip: Candidate,
-    work_dir: str,
-    out_res: Optional[Tuple[int, int]],
-    bar_pct: float,
-    top_text_tpl: str,
-    bottom_text_tpl: str,
-    font: str,
-    font_size: int,
-) -> str:
-  """Create vf filters that draw solid bars and top/bottom text.
-
-  Uses drawtext textfile= to avoid escaping issues and allow UTF-8 text.
-  Layout goals:
-    - Top hook sits comfortably inside the top bar (not hugging the edge).
-    - Bottom subtitle/punchline is fully visible above the bottom edge.
-    - Text is wrapped to 1â€“3 short lines for readability.
-  """
-  # Select a sane reference size (after pad/scale). If unknown, rely on `h` (`ih`) in expressions.
-  # Bar height in pixels (expression). Keep within [40px, 25%].
-  bar_pct = float(bar_pct)
-  if bar_pct <= 0:
-    bar_pct = 0.16
-  if bar_pct > 0.30:
-    bar_pct = 0.30
-
-  # Build dynamic text. Use transcript snippet as description.
-  snippet = re.sub(r"\s+", " ", (clip.text or "").strip())
-  if snippet:
-    snippet = snippet[:160].rstrip() + ("..." if len(snippet) > 160 else "")
-  else:
-    snippet = "Epic moment incoming"
-
-  # Generate intelligent hook and punchline from transcript
-  hook = _extract_hook(clip.text or "")
-  punchline = _extract_punchline(clip.text or "")
-
-  # Try to enhance with Ollama if available, fall back to extracted versions
-  ollama_hook = _generate_smart_hook_ollama(clip.text or "", hook)
-  ollama_punchline = _generate_smart_punchline_ollama(clip.text or "", punchline)
-
-  hook = ollama_hook if ollama_hook else hook
-  punchline = ollama_punchline if ollama_punchline else punchline
-
-  # Template variables: {desc}, {i}, {hook}, {punchline}
-  def _fmt(tpl: str) -> str:
-    tpl = (tpl or "").strip()
-    if not tpl:
-      return ""
-    return tpl.format(desc=snippet, i=clip_index, hook=hook, punchline=punchline)
-
-  raw_top = _fmt(top_text_tpl) or hook or "Wait for it..."
-  raw_bottom = _fmt(bottom_text_tpl) or punchline or snippet
-
-  # Wrap to keep within bars; hooks can be a bit shorter.
-  top_text = _wrap_overlay_text(raw_top, max_chars=22, max_lines=2)
-  bottom_text = _wrap_overlay_text(raw_bottom, max_chars=26, max_lines=3)
-
-  top_file = _write_textfile_utf8(os.path.join(work_dir, f"overlay_{clip_index:02d}_top.txt"), top_text)
-  bot_file = _write_textfile_utf8(os.path.join(work_dir, f"overlay_{clip_index:02d}_bottom.txt"), bottom_text)
-
-  top_file_vf = _vf_escape_path(top_file)
-  bot_file_vf = _vf_escape_path(bot_file)
-
-  # Font handling:
-  # - Prefer a font file if provided
-  # - If a plain family name is provided, do NOT force font=... because some ffmpeg builds
-  #   route that through fontconfig (and error on Windows). In that case we just omit it
-  #   and let drawtext pick a default.
-  font_arg = ""
-  if font:
-    f = (font or "").strip().strip('"')
-    if os.path.exists(f):
-      font_arg = f":fontfile='{_vf_escape_path(f)}'"
-    else:
-      font_arg = ""
-
-  fs = int(font_size) if int(font_size) > 0 else 48
-  if out_res is not None:
-    _tw, th = out_res
-    # 1920-height baseline -> fontsize ~ 54 (slightly smaller than before).
-    fs = int(max(24, round(fs * (th / 1920.0))))
-
-  bh = f"ih*{bar_pct:.4f}"
-
-  # Place text vertically using simple percentages so ffmpeg's expression
-  # parser on Windows doesn't choke on nested expressions. We keep the
-  # text comfortably inside the bars.
-  # Top: roughly centered in top bar (~half bar height from top).
-  # Bottom: centered in bottom bar, a bit above the very bottom.
-  top_y = "(h*{pct:.4f}-text_h)/2".format(pct=bar_pct)
-  bot_y = "h-(h*{pct:.4f})+(h*{pct:.4f}-text_h)/2".format(pct=bar_pct)
-
-  # Draw solid bars (black). Then draw text centered within bars.
-  # Use alpha-safe colors; add subtle shadow for readability.
-  return ",".join([
-    f"drawbox=x=0:y=0:w=iw:h={bh}:color=black@1:t=fill",
-    f"drawbox=x=0:y=ih-({bh}):w=iw:h={bh}:color=black@1:t=fill",
-    (
-      "drawtext="
-      f"textfile='{top_file_vf}'{font_arg}:reload=0:"
-      f"fontcolor=white:fontsize={fs}:line_spacing=4:shadowcolor=black:shadowx=2:shadowy=2:"
-      "x=(w-text_w)/2:"
-      f"y={top_y}"
-    ),
-    (
-      "drawtext="
-      f"textfile='{bot_file_vf}'{font_arg}:reload=0:"
-      f"fontcolor=white:fontsize={max(22, int(fs*0.85))}:line_spacing=4:shadowcolor=black:shadowx=2:shadowy=2:"
-      "x=(w-text_w)/2:"
-      f"y={bot_y}"
-    ),
-  ])
-
-
-def build_shorts_overlay_vf(
-    *,
-    clip_index: int,
-    clip: Candidate,
-    work_dir: str,
-    out_res: Optional[Tuple[int, int]],
-    top_text_tpl: str,
-    bottom_text_tpl: str,
-    font: str,
-    font_size: int,
-    top_pad_pct: float,
-    bottom_pad_pct: float,
-    border_w: int,
-    border_color: str,
-    shadow_x: int,
-    shadow_y: int,
-) -> str:
-  """Shorts/TikTok-style overlay: large outlined text at top (+ optional bottom).
-
-  Matches typical Shorts look:
-    - no solid black bars
-    - thick outline (borderw) for readability
-    - centered text, multi-line wrapped
-
-  Note: background blur/fill is handled by aspect/pad + target-res in `build_vf_chain`.
-  """
-  # Build dynamic text.
-  snippet = re.sub(r"\s+", " ", (clip.text or "").strip())
-  if snippet:
-    snippet = snippet[:160].rstrip() + ("..." if len(snippet) > 160 else "")
-  else:
-    snippet = "Epic moment incoming"
-
-  hook = _extract_hook(clip.text or "")
-  punchline = _extract_punchline(clip.text or "")
-
-  ollama_hook = _generate_smart_hook_ollama(clip.text or "", hook)
-  ollama_punchline = _generate_smart_punchline_ollama(clip.text or "", punchline)
-  hook = ollama_hook if ollama_hook else hook
-  punchline = ollama_punchline if ollama_punchline else punchline
-
-  def _fmt(tpl: str) -> str:
-    tpl = (tpl or "").strip()
-    if not tpl:
-      return ""
-    return tpl.format(desc=snippet, i=clip_index, hook=hook, punchline=punchline)
-
-  raw_top = _fmt(top_text_tpl) or hook or "Wait for it..."
-  raw_bottom = _fmt(bottom_text_tpl) or ""
-
-  top_text = _wrap_overlay_text(raw_top, max_chars=24, max_lines=3)
-  bottom_text = _wrap_overlay_text(raw_bottom, max_chars=28, max_lines=2) if raw_bottom.strip() else ""
-
-  top_file = _write_textfile_utf8(os.path.join(work_dir, f"overlay_{clip_index:02d}_top.txt"), top_text)
-  top_file_vf = _vf_escape_path(top_file)
-
-  bot_file_vf = ""
-  if bottom_text:
-    bot_file = _write_textfile_utf8(os.path.join(work_dir, f"overlay_{clip_index:02d}_bottom.txt"), bottom_text)
-    bot_file_vf = _vf_escape_path(bot_file)
-
-  # Font handling (same policy as build_overlay_vf)
-  font_arg = ""
-  if font:
-    f = (font or "").strip().strip('"')
-    if os.path.exists(f):
-      font_arg = f":fontfile='{_vf_escape_path(f)}'"
-
-  fs = int(font_size) if int(font_size) > 0 else 56
-  if out_res is not None:
-    _tw, th = out_res
-    fs = int(max(22, round(fs * (th / 1920.0))))
-
-  # Place text with simple % padding from edges.
-  # Use y=... as expression strings; keep it simple for Windows builds.
-  top_pad_pct = float(top_pad_pct)
-  bottom_pad_pct = float(bottom_pad_pct)
-  if top_pad_pct <= 0:
-    top_pad_pct = 0.06
-  if bottom_pad_pct <= 0:
-    bottom_pad_pct = 0.10
-
-  top_y = f"h*{top_pad_pct:.4f}"
-  bot_y = f"h-(text_h + h*{bottom_pad_pct:.4f})"
-
-  # Normalize border args.
-  bw = max(0, int(border_w))
-  bx = int(shadow_x)
-  by = int(shadow_y)
-  bc = (border_color or "black").strip() or "black"
-
-  parts: List[str] = []
-
-  parts.append(
-    (
-      "drawtext="
-      f"textfile='{top_file_vf}'{font_arg}:reload=0:"
-      f"fontcolor=white:fontsize={fs}:line_spacing=6:"
-      f"borderw={bw}:bordercolor={bc}:"
-      f"shadowcolor=black@0.75:shadowx={bx}:shadowy={by}:"
-      "x=(w-text_w)/2:"
-      f"y={top_y}"
-    )
-  )
-
-  if bot_file_vf:
-    parts.append(
-      (
-        "drawtext="
-        f"textfile='{bot_file_vf}'{font_arg}:reload=0:"
-        f"fontcolor=white:fontsize={max(20, int(fs*0.72))}:line_spacing=6:"
-        f"borderw={max(0, int(round(bw*0.85)))}:bordercolor={bc}:"
-        f"shadowcolor=black@0.75:shadowx={bx}:shadowy={by}:"
-        "x=(w-text_w)/2:"
-        f"y={bot_y}"
-      )
-    )
-
-  return ",".join(parts)
-
-
-# ----------------------------
-# ffprobe
-# ----------------------------
-def ffprobe_duration(video_path: str) -> float:
-  """Return video duration in seconds.
-
-  Primary method: ffprobe.
-  Fallback: parse duration from `ffmpeg -i` output.
-  """
-  # Use args list so paths with spaces/apostrophes work on Windows
-  probe_variants: List[List[str]] = [
-    [
-      FFPROBE,
-      "-v", "error",
-      "-show_entries", "format=duration",
-      "-of", "default=nk=1:nw=1",
-      video_path,
-    ],
-    [
-      FFPROBE,
-      "-hide_banner",
-      "-v", "error",
-      "-show_entries", "format=duration",
-      "-of", "json",
-      video_path,
-    ],
-  ]
-
-  last_err = ""
-  for args in probe_variants:
-    try:
-      p = subprocess.run(args, check=True, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-      out = ((p.stdout or "") + (p.stderr or "")).strip()
-      if not out:
-        continue
-      # default output is a bare float; json output is {"format":{"duration":"..."}}
-      m = re.search(r"([0-9]+(?:\.[0-9]+)?)", out)
-      if m:
-        return float(m.group(1))
-    except subprocess.CalledProcessError as e:
-      last_err = ((e.stdout or "") + (e.stderr or "")).strip()
-      continue
+        cmd = [FFMPEG, "-i", video_path, "-hide_banner"]
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, universal_newlines=True)
+
+        # Look for duration in output
+        duration_match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})", output)
+        if duration_match:
+            hours = int(duration_match.group(1))
+            minutes = int(duration_match.group(2))
+            seconds = int(duration_match.group(3))
+            centiseconds = int(duration_match.group(4))
+            return hours * 3600 + minutes * 60 + seconds + centiseconds / 100
+        return 0
     except Exception as e:
-      last_err = str(e)
-      continue
-
-  # Fallback: parse duration from ffmpeg -i
-  try:
-    p = subprocess.run([FFMPEG, "-hide_banner", "-i", video_path], check=False, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-    txt = (p.stdout or "") + (p.stderr or "")
-    # Example: Duration: 00:23:19.55,
-    m = re.search(r"Duration:\s*(\d\d):(\d\d):(\d\d(?:\.\d+)?)", txt)
-    if m:
-      hh = int(m.group(1))
-      mm = int(m.group(2))
-      ss = float(m.group(3))
-      return hh * 3600 + mm * 60 + ss
-  except Exception:
-    pass
-
-  raise RuntimeError(
-    "Could not determine video duration. ffprobe failed and ffmpeg fallback failed. "
-    f"ffprobe error: {last_err[:500]}"
-  )
+        # Try another approach with ffprobe
+        try:
+            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                   "-of", "default=noprint_wrappers=1:nokey=1", video_path]
+            output = subprocess.check_output(cmd, universal_newlines=True).strip()
+            return float(output)
+        except:
+            print(f"Error getting video duration: {e}")
+            # Fallback to a reasonable default duration for anime episodes
+            return 1400  # ~23 minutes
 
 
-def clamp(x: float, lo: float, hi: float) -> float:
-  return max(lo, min(hi, x))
-
-
-def tokenize(text: str) -> List[str]:
-  text = re.sub(r"[^\w\s']+", " ", text.lower())
-  return [t for t in text.split() if t]
-
-
-# ----------------------------
-# Naming + caching helpers
-# ----------------------------
-def safe_basename_no_ext(path: str) -> str:
-  base = os.path.splitext(os.path.basename(path))[0]
-  # Keep it Windows-friendly
-  base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base)
-  return base.strip() or "video"
-
-
-def cached_work_paths(video_path: str, work_dir: str) -> Tuple[str, str]:
-  """Return (wav_path, srt_path) for a given input video, using stable names."""
-  stem = safe_basename_no_ext(video_path)
-  wav_path = os.path.join(work_dir, f"{stem}_audio_16k_mono.wav")
-  srt_path = os.path.join(work_dir, f"{stem}.srt")
-  return wav_path, srt_path
-
-
-def _asr_cache_meta_path(video_path: str, work_dir: str) -> str:
-  stem = safe_basename_no_ext(video_path)
-  return os.path.join(work_dir, f"{stem}.asr.json")
-
-
-def _load_json(path: str) -> Optional[dict]:
-  try:
-    with open(path, "r", encoding="utf-8") as f:
-      return json.load(f)
-  except Exception:
-    return None
-
-
-def _write_json(path: str, data: dict) -> None:
-  try:
-    with open(path, "w", encoding="utf-8") as f:
-      json.dump(data, f, indent=2)
-  except Exception:
-    pass
-
-
-# ----------------------------
-# Transcript (SRT)
-# ----------------------------
-def srt_time_to_sec(t: str) -> float:
-  hh, mm, rest = t.split(":")
-  ss, ms = rest.split(",")
-  return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
-
-
-def load_srt(path: str) -> List[Segment]:
-  with open(path, "r", encoding="utf-8", errors="ignore") as f:
-    data = f.read()
-  blocks = re.split(r"\n\s*\n", data.strip())
-  segs: List[Segment] = []
-  for b in blocks:
-    lines = [ln.strip() for ln in b.splitlines() if ln.strip()]
-    if len(lines) < 3:
-      continue
-    m = re.match(
-      r"(\d\d:\d\d:\d\d,\d\d\d)\s*-->\s*(\d\d:\d\d:\d\d,\d\d\d)",
-      lines[1],
-    )
-    if not m:
-      continue
-    start = srt_time_to_sec(m.group(1))
-    end = srt_time_to_sec(m.group(2))
-    text = " ".join(lines[2:]).strip()
-    text = re.sub(r"\s+", " ", text)
-    if text:
-      segs.append(Segment(start, end, text))
-  return segs
-
-
-def _format_srt_time(seconds: float) -> str:
-  seconds = max(0.0, float(seconds))
-  ms = int(round((seconds - int(seconds)) * 1000))
-  s = int(seconds) % 60
-  m = (int(seconds) // 60) % 60
-  h = int(seconds) // 3600
-  return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def _write_srt(path: str, entries: List[Tuple[float, float, str]]) -> None:
-  with open(path, "w", encoding="utf-8") as f:
-    for i, (st, en, txt) in enumerate(entries, start=1):
-      f.write(f"{i}\n")
-      f.write(f"{_format_srt_time(st)} --> {_format_srt_time(en)}\n")
-      f.write((txt or "").strip() + "\n\n")
-
-
-def run_faster_whisper_to_srt(
-    wav_path: str,
-    srt_path: str,
-    language: str = "auto",
-    model: str = "small",
-    device: str = "auto",
-    compute_type: str = "auto",
-) -> str:
-  """Transcribe wav -> SRT using faster-whisper (ctranslate2).
-
-  Important: On Windows, CUDA builds can fail hard if cuDNN DLLs aren't on PATH.
-  This function avoids selecting CUDA when cuDNN isn't discoverable, and will
-  fall back to CPU automatically if CUDA initialization fails.
-  """
-  try:
-    from faster_whisper import WhisperModel
-  except Exception as e:
-    raise RuntimeError("faster-whisper is not installed. Install it or switch --asr-backend whispercpp") from e
-
-  # Decide device deterministically.
-  if device == "cuda":
-    fw_device = "cuda"
-  elif device == "cpu":
-    fw_device = "cpu"
-  else:
-    # auto: prefer CUDA only if CUDA is available AND cuDNN DLLs are discoverable.
-    fw_device = "cpu"
-    can_try_cuda = _windows_has_cudnn_on_path()
-    if not can_try_cuda and os.name == "nt":
-      print("[ASR] cuDNN DLLs not found on PATH; skipping CUDA and using CPU.")
+def detect_audio_language(video_path: str) -> str:
+    """
+    Accurately detect the language of the video by analyzing audio samples.
+    Returns "japanese" for Japanese audio, "english" for English audio,
+    or "auto" if detection is uncertain.
+    """
     try:
-      if can_try_cuda:
-        import ctranslate2  # type: ignore
-        if hasattr(ctranslate2, "get_cuda_device_count") and ctranslate2.get_cuda_device_count() > 0:
-          fw_device = "cuda"
-    except Exception:
-      fw_device = "cpu"
+        import whisper
+        import torch
+        import numpy as np
 
-  # Pick compute type defaults.
-  if compute_type != "auto":
-    fw_compute = compute_type
-  else:
-    fw_compute = "float16" if fw_device == "cuda" else "int8"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[Language Detection] Using {device} for language detection")
 
-  def _do(device_name: str, compute_name: str) -> str:
-    print(f"[ASR] faster-whisper model={model} device={device_name} compute_type={compute_name}")
-    wm = WhisperModel(model, device=device_name, compute_type=compute_name)
-    segments, _info = wm.transcribe(
-      wav_path,
-      language=None if (not language or language == "auto") else language,
-      beam_size=1,
-      vad_filter=True,
-    )
+        # Extract multiple audio samples for more accurate detection
+        # We'll take samples from different parts of the video
+        duration = get_video_duration(video_path)
 
-    entries: List[Tuple[float, float, str]] = []
-    for s in segments:
-      txt = (s.text or "").strip()
-      if not txt:
-        continue
-      entries.append((float(s.start), float(s.end), txt))
+        # Define sample points (skip intro, take from multiple points)
+        sample_points = []
+        if duration < 300:  # Short video under 5 minutes
+            # For short videos, just take one sample from the middle
+            sample_points = [(duration * 0.5, min(30, duration * 0.5))]
+        else:
+            # For longer videos, take multiple samples
+            sample_points = [
+                (max(90, duration * 0.1), 30),  # 10% in (after intro)
+                (duration * 0.4, 30),  # 40% in
+                (duration * 0.7, 30)  # 70% in
+            ]
 
-    if not entries:
-      raise RuntimeError("faster-whisper produced 0 segments")
+        # Load tiny model for quick language detection
+        print("[Language Detection] Loading lightweight model for language detection...")
+        model = whisper.load_model("tiny", device=device)
 
-    _write_srt(srt_path, entries)
+        # Process each sample
+        language_votes = {}
+
+        for i, (start_time, sample_duration) in enumerate(sample_points):
+            # Extract audio sample
+            temp_audio = os.path.join(os.path.dirname(video_path), f"temp_lang_detect_{i}.wav")
+            print(f"[Language Detection] Extracting sample {i + 1}/{len(sample_points)} at {start_time:.1f}s...")
+            extract_audio(video_path, temp_audio, start_time, sample_duration)
+
+            # Detect language
+            audio = whisper.load_audio(temp_audio)
+            audio = whisper.pad_or_trim(audio)
+            mel = whisper.log_mel_spectrogram(audio).to(device)
+            _, probs = model.detect_language(mel)
+
+            # Get top language and confidence
+            detected_lang = max(probs, key=probs.get)
+            confidence = probs[detected_lang]
+
+            print(f"[Language Detection] Sample {i + 1}: {detected_lang} ({confidence:.1%} confidence)")
+
+            # Add to votes, weighted by confidence
+            language_votes[detected_lang] = language_votes.get(detected_lang, 0) + confidence
+
+            # Clean up
+            if os.path.exists(temp_audio):
+                os.remove(temp_audio)
+
+        # Determine final language based on weighted votes
+        if language_votes:
+            final_lang = max(language_votes, key=language_votes.get)
+            total_confidence = sum(language_votes.values())
+            final_confidence = language_votes[final_lang] / total_confidence if total_confidence > 0 else 0
+
+            print(f"[Language Detection] Final detection: {final_lang} with {final_confidence:.1%} confidence")
+
+            # Map to our supported languages
+            if final_lang == "ja" and final_confidence > 0.4:
+                return "japanese"
+            elif final_lang == "en" and final_confidence > 0.4:
+                return "english"
+
+            # For other languages with high confidence, return auto
+            if final_confidence > 0.6:
+                print(f"[Language Detection] Detected {final_lang} but using 'auto' for best results")
+                return "auto"
+
+        # Clean up GPU memory
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    except Exception as e:
+        print(f"[Language Detection] Error during audio language detection: {e}")
+
+    # Default to auto if detection fails or is uncertain
+    print("[Language Detection] Could not confidently detect language, using automatic detection")
+    return "auto"
+
+
+def extract_audio(video_path: str, output_path: str, start_time: float = 0, duration: float = 0) -> bool:
+    """Extract audio from video for faster processing."""
+    try:
+        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
+
+        if start_time > 0:
+            cmd.extend(["-ss", str(start_time)])
+
+        cmd.extend(["-i", video_path, "-vn", "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1"])
+
+        if duration > 0:
+            cmd.extend(["-t", str(duration)])
+
+        cmd.append(output_path)
+
+        subprocess.run(cmd, check=True)
+        return True
+    except Exception as e:
+        print(f"Error extracting audio: {e}")
+        return False
+
+
+def transcribe_video(video_path: str, model_size: str, language: str, transcript_output: Optional[str] = None) -> str:
+    """
+    Transcribes video using OpenAI Whisper with optimized GPU usage.
+    Avoids chunking for better quality and performance.
+    """
+    try:
+        import whisper
+        import torch
+    except ImportError:
+        print("\n[!] Error: 'openai-whisper' or 'torch' not installed.")
+        print("    Please run: pip install openai-whisper torch")
+        sys.exit(1)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\n[Whisper] Loading model '{model_size}' on {device.upper()}...")
+
+    # Set output path
+    if transcript_output:
+        srt_path = transcript_output
+    else:
+        # Default location next to the video
+        srt_path = os.path.splitext(video_path)[0] + ".srt"
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(os.path.abspath(srt_path)), exist_ok=True)
+
+    # Extract audio first - this is much faster than having Whisper read the video
+    print("[Whisper] Extracting audio from video (this speeds up processing)...")
+    audio_path = os.path.join(os.path.dirname(srt_path), "temp_audio.wav")
+    extract_audio(video_path, audio_path)
+
+    # Get video duration
+    duration = get_video_duration(video_path)
+    print(f"[Whisper] Video duration: {duration:.2f} seconds")
+
+    # Check available GPU memory
+    gpu_memory_gb = 0
+    if device == "cuda":
+        try:
+            # Get available GPU memory in GB
+            free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+            gpu_memory_gb = free_memory / (1024 ** 3)
+            print(f"[Whisper] Available GPU memory: {gpu_memory_gb:.2f} GB")
+        except:
+            print("[Whisper] Could not determine available GPU memory")
+
+    # Determine if we need to process in chunks based on model size and available memory
+    # These are conservative estimates for RTX 3060 (6GB)
+    memory_requirements = {
+        "tiny": 1,  # ~1GB
+        "base": 1.5,  # ~1.5GB
+        "small": 3,  # ~3GB
+        "medium": 5,  # ~5GB
+        "large": 10  # ~10GB
+    }
+
+    # For long videos, we need more memory
+    memory_multiplier = min(1.5, max(1.0, duration / 1800))  # Increase for videos > 30 min
+    required_memory = memory_requirements.get(model_size, 5) * memory_multiplier
+
+    # Process in one go if we have enough memory, otherwise use chunking
+    use_chunking = (device == "cuda" and gpu_memory_gb > 0 and gpu_memory_gb < required_memory)
+
+    if use_chunking:
+        print(
+            f"[Whisper] Memory requirements ({required_memory:.1f}GB) exceed available GPU memory, using optimized chunking")
+        # Optimize chunk size based on available memory
+        chunk_size = min(300, max(60, int(600 * (gpu_memory_gb / required_memory))))
+        print(f"[Whisper] Using {chunk_size}s chunks for optimal GPU performance")
+    else:
+        print("[Whisper] Processing entire audio in one pass for best quality")
+        chunk_size = 0  # Process all at once
+
+    try:
+        # Load model with appropriate precision for GPU
+        model = whisper.load_model(model_size, device=device)
+
+        # Determine precision based on model size and device
+        use_half = False
+        if device == "cuda":
+            # For RTX 3060, use FP16 only for tiny and base models
+            if model_size in ["tiny", "base"]:
+                try:
+                    model = model.half()
+                    use_half = True
+                    print("[Whisper] Using half precision (FP16) for faster processing")
+                except Exception as e:
+                    print(f"[Whisper] Warning: Could not use half precision: {e}")
+                    print("[Whisper] Falling back to full precision (FP32)")
+            else:
+                print("[Whisper] Using full precision (FP32) for better accuracy with larger model")
+
+        # Language handling
+        lang_arg = None if language == "auto" else language
+        if language == "japanese": lang_arg = "ja"
+        if language == "english": lang_arg = "en"
+
+        print(f"[Whisper] Transcribing with language setting: {language}")
+
+        if chunk_size <= 0 or duration <= chunk_size:
+            # Process entire audio in one go
+            start_time = time.time()
+
+            # Use more aggressive compression for long files to fit in memory
+            if duration > 1800 and device == "cuda":  # > 30 minutes
+                print("[Whisper] Long audio detected, using memory-efficient processing")
+                # For very long files, we need to be careful with memory
+                result = model.transcribe(
+                    audio_path,
+                    language=lang_arg,
+                    verbose=False,
+                    fp16=use_half,
+                    beam_size=3  # Smaller beam size to save memory
+                )
+            else:
+                # Standard processing for shorter files
+                result = model.transcribe(
+                    audio_path,
+                    language=lang_arg,
+                    verbose=False,
+                    fp16=use_half
+                )
+
+            elapsed = time.time() - start_time
+            print(f"[Whisper] Transcription completed in {elapsed:.2f} seconds")
+
+            # Report detected language if auto was used
+            if language == "auto" and "language" in result:
+                detected_code = result.get("language", "unknown")
+                language_names = {
+                    "en": "English",
+                    "ja": "Japanese",
+                    "zh": "Chinese",
+                    "ko": "Korean",
+                    "fr": "French",
+                    "de": "German",
+                    "es": "Spanish",
+                    "ru": "Russian"
+                }
+                detected_name = language_names.get(detected_code, f"Unknown ({detected_code})")
+                print(f"[Whisper] Detected language: {detected_name}")
+
+            # Write SRT
+            with open(srt_path, "w", encoding="utf-8") as f:
+                for i, segment in enumerate(result["segments"]):
+                    start = format_timestamp(segment["start"])
+                    end = format_timestamp(segment["end"])
+                    text = segment["text"].strip()
+                    f.write(f"{i + 1}\n{start} --> {end}\n{text}\n\n")
+        else:
+            # Process in optimized chunks with overlap for better transitions
+            print(f"[Whisper] Processing in optimized chunks with overlap for seamless transitions")
+
+            all_segments = []
+            detected_language = None
+            overlap = 5  # 5 second overlap between chunks
+
+            # Process video in chunks with overlap
+            for chunk_start in range(0, int(duration), chunk_size - overlap):
+                # Adjust last chunk to not exceed duration
+                chunk_duration = min(chunk_size, duration - chunk_start)
+                if chunk_duration <= overlap:
+                    break  # Skip processing if this chunk would be too small
+
+                print(
+                    f"[Whisper] Processing chunk {chunk_start / 60:.1f}-{(chunk_start + chunk_duration) / 60:.1f} minutes...")
+
+                # Extract audio chunk
+                chunk_audio = os.path.join(os.path.dirname(srt_path), f"temp_chunk_{chunk_start}.wav")
+                extract_audio(video_path, chunk_audio, chunk_start, chunk_duration)
+
+                # Transcribe chunk
+                start_time = time.time()
+                chunk_result = model.transcribe(chunk_audio, language=lang_arg, verbose=False, fp16=use_half)
+                elapsed = time.time() - start_time
+
+                # Store detected language from first chunk if using auto
+                if chunk_start == 0 and language == "auto" and "language" in chunk_result:
+                    detected_language = chunk_result.get("language")
+
+                # Adjust timestamps to account for chunk position
+                for segment in chunk_result["segments"]:
+                    # Adjust timestamps
+                    segment["start"] += chunk_start
+                    segment["end"] += chunk_start
+
+                    # Only include segments that start within this chunk's primary range
+                    # (excluding the overlap region with the next chunk)
+                    if chunk_start == 0 or segment["start"] >= chunk_start:
+                        # For chunks after the first one, exclude segments that start in the overlap region
+                        # with the previous chunk (they were already included)
+                        if chunk_start == 0 or segment["start"] >= chunk_start + overlap:
+                            all_segments.append(segment)
+
+                # Clean up chunk audio
+                os.remove(chunk_audio)
+
+                print(f"[Whisper] Chunk processed in {elapsed:.2f} seconds")
+
+                # Free up GPU memory
+                torch.cuda.empty_cache()
+
+            # Report detected language if auto was used
+            if detected_language:
+                language_names = {
+                    "en": "English",
+                    "ja": "Japanese",
+                    "zh": "Chinese",
+                    "ko": "Korean",
+                    "fr": "French",
+                    "de": "German",
+                    "es": "Spanish",
+                    "ru": "Russian"
+                }
+                detected_name = language_names.get(detected_language, f"Unknown ({detected_language})")
+                print(f"[Whisper] Detected language: {detected_name}")
+
+            # Sort segments by start time
+            all_segments.sort(key=lambda x: x["start"])
+
+            # Write combined SRT
+            with open(srt_path, "w", encoding="utf-8") as f:
+                for i, segment in enumerate(all_segments):
+                    start = format_timestamp(segment["start"])
+                    end = format_timestamp(segment["end"])
+                    text = segment["text"].strip()
+                    f.write(f"{i + 1}\n{start} --> {end}\n{text}\n\n")
+    finally:
+        # Clean up
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+        # Final GPU cleanup
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    print(f"[Whisper] Saved transcript to {srt_path}")
     return srt_path
 
-  # First attempt (maybe CUDA).
-  try:
-    return _do(fw_device, fw_compute)
-  except Exception as e:
-    msg = str(e)
-    # Common Windows CUDA/cuDNN failures:
-    cuda_like = any(
-      k in msg.lower()
-      for k in [
-        "cudnn",
-        "cublas",
-        "cuda",
-        "invalid handle",
-        "cannot load symbol",
-        "could not locate",
-        "loadlibrary",
-        "dll",
-      ]
-    )
-    if fw_device == "cuda" and cuda_like:
-      print(f"[ASR] CUDA transcription failed ({type(e).__name__}: {e}). Falling back to CPU (int8).")
-      return _do("cpu", "int8")
-    raise
+
+def parse_srt(srt_path: str) -> List[Candidate]:
+    """Parses an SRT file into Candidate objects."""
+    candidates = []
+    if not os.path.exists(srt_path):
+        return candidates
+
+    with open(srt_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Regex to split SRT blocks
+    blocks = re.split(r'\n\n+', content.strip())
+
+    for block in blocks:
+        lines = block.split('\n')
+        if len(lines) >= 3:
+            # Parse Time: 00:00:00,000 --> 00:00:05,000
+            times = lines[1].split(' --> ')
+            if len(times) != 2: continue
+
+            def time_to_sec(t_str):
+                h, m, s = t_str.replace(',', '.').split(':')
+                return int(h) * 3600 + int(m) * 60 + float(s)
+
+            try:
+                start = time_to_sec(times[0])
+                end = time_to_sec(times[1])
+                text = " ".join(lines[2:])
+                candidates.append(Candidate(start, end, text))
+            except:
+                continue
+    return candidates
 
 
-# ----------------------------
-# Whisper.cpp integration
-# ----------------------------
-def extract_audio_wav(video_path: str, wav_path: str) -> None:
-  args = [
-    FFMPEG, "-y",
-    "-i", video_path,
-    "-vn",
-    "-ac", "1",
-    "-ar", "16000",
-    "-c:a", "pcm_s16le",
-    wav_path,
-  ]
-  run(args)
+# ==========================================
+# 3. System & Tool Utilities
+# ==========================================
 
+def get_system_font_path(font_name: str) -> str:
+    """Smart cross-platform font finder."""
+    if os.path.exists(font_name): return os.path.abspath(font_name)
+    system = platform.system()
+    search_dirs = []
+    if system == "Windows":
+        search_dirs = [os.path.join(os.environ["WINDIR"], "Fonts")]
+    elif system == "Darwin":
+        search_dirs = ["/Library/Fonts", "/System/Library/Fonts"]
+    else:
+        search_dirs = ["/usr/share/fonts", os.path.expanduser("~/.fonts")]
 
-def whisper_cli_help() -> str:
-  # Resolve whisper-cli lazily so the rest of the script can run without it.
-  global WHISPER_CLI
-  if not WHISPER_CLI:
-    try:
-      WHISPER_CLI = resolve_exe(env_var="ANIMECLIPS_WHISPER_CLI", default_names=["whisper-cli", "whisper-cli.exe"], label="whisper-cli")
-    except Exception:
-      return ""
+    # For Japanese/CJK support, prioritize these fonts
+    if any(c for c in font_name if unicodedata.east_asian_width(c) in ('F', 'W')):
+        priority_fonts = ["yumin", "msgothic", "meiryo", "hiragino", "noto", "droid"]
+        for d in search_dirs:
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.lower().endswith((".ttf", ".otf")):
+                        for pf in priority_fonts:
+                            if pf in f.lower():
+                                return os.path.join(root, f)
 
-  try:
-    p = subprocess.run([WHISPER_CLI, "-h"], check=True, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-    return (p.stdout or "") + (p.stderr or "")
-  except Exception:
+    target = font_name.lower().replace(" ", "")
+    for d in search_dirs:
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith((".ttf", ".otf")) and target in f.lower().replace("-", ""):
+                    return os.path.join(root, f)
+
+    # Fallback to a system font that supports CJK if needed
+    for d in search_dirs:
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith((".ttf", ".otf")) and any(x in f.lower() for x in ["arial", "helvetica", "sans"]):
+                    return os.path.join(root, f)
     return ""
 
 
-def whisper_cli_supports_flag(flag: str) -> bool:
-  out = whisper_cli_help()
-  return flag in out if out else False
+def resolve_exe(tool_name: str) -> str:
+    """Find executable."""
+    path = shutil.which(tool_name)
+    if path: return path
+    if platform.system() == "Windows":
+        common = [r"C:\Program Files\ffmpeg\bin\ffmpeg.exe", r"C:\ffmpeg\bin\ffmpeg.exe"]
+        for p in common:
+            if os.path.exists(p): return p
+    raise FileNotFoundError(f"Could not find {tool_name}.")
 
 
-def run_whisper_to_srt(
-    wav_path: str,
-    out_dir: str,
-    language: str = "auto",
-    threads: int = 6,
-    use_vad: bool = True,
-    base_name: Optional[str] = None,
-) -> str:
-  """Run whisper.cpp and return an SRT path."""
+def get_video_hash(video_path: str) -> str:
+    """Generate a unique hash for the video file to identify it."""
+    if not os.path.exists(video_path):
+        return "unknown"
 
-  global WHISPER_CLI, WHISPER_MODEL, WHISPER_VAD_MODEL
-
-  # Resolve whisper-cli + model paths.
-  if not WHISPER_CLI:
-    WHISPER_CLI = resolve_exe(env_var="ANIMECLIPS_WHISPER_CLI", default_names=["whisper-cli", "whisper-cli.exe"], label="whisper-cli")
-
-  if not WHISPER_MODEL:
-    raise FileNotFoundError(
-      "whisper.cpp model not configured. Set ANIMECLIPS_WHISPER_MODEL to a ggml/gguf model path, "
-      "or switch to --asr-backend faster-whisper."
-    )
-
-  exists_or_raise(WHISPER_CLI, "whisper-cli")
-  exists_or_raise(WHISPER_MODEL, "whisper model")
-  if use_vad:
-    if not WHISPER_VAD_MODEL:
-      raise FileNotFoundError(
-        "whisper.cpp VAD model not configured. Set ANIMECLIPS_WHISPER_VAD_MODEL or disable VAD."
-      )
-    exists_or_raise(WHISPER_VAD_MODEL, "VAD model")
-
-  os.makedirs(out_dir, exist_ok=True)
-
-  # Use stable name when possible (cache-friendly)
-  if base_name:
-    base = os.path.join(out_dir, base_name)
-  else:
-    base = os.path.join(out_dir, f"whisper_{int(time.time())}")
-
-  common = [
-    WHISPER_CLI,
-    "-m", WHISPER_MODEL,
-    "-f", wav_path,
-    "-osrt",
-    "-of", base,
-    "-t", str(int(threads)),
-  ]
-  if language and language != "auto":
-    common += ["-l", language]
-
-  vad_variants: List[List[str]] = []
-  if use_vad:
-    # Try likely VAD flags; fall back to no VAD if not supported.
-    if whisper_cli_supports_flag("vad-model") or whisper_cli_supports_flag("--vad-model"):
-      vad_variants.append(["--vad-model", WHISPER_VAD_MODEL])
-    if whisper_cli_supports_flag("\n  -vm") or whisper_cli_supports_flag(" -vm"):
-      vad_variants.append(["-vm", WHISPER_VAD_MODEL])
-    if whisper_cli_supports_flag("--vad"):
-      vad_variants.append(["--vad"])
-    vad_variants.append([])  # fallback
-  else:
-    vad_variants = [[]]
-
-  last_err = None
-  for extra in vad_variants:
-    args = common + extra
-    try:
-      run(args)
-      srt_path = base + ".srt"
-      if os.path.exists(srt_path):
-        return srt_path
-      # Fallback scan
-      for fn in os.listdir(out_dir):
-        if fn.lower().endswith(".srt") and fn.lower().startswith(os.path.basename(base).lower()):
-          return os.path.join(out_dir, fn)
-      raise RuntimeError("whisper ran but .srt not found in out_dir")
-    except subprocess.CalledProcessError as e:
-      last_err = e
-      print("whisper failed with these args, retrying if possible:", extra)
-      continue
-
-  raise RuntimeError(f"whisper failed. Last error: {last_err}")
+    # Use file size and name as a simple hash
+    file_size = os.path.getsize(video_path)
+    basename = os.path.basename(video_path)
+    hash_input = f"{basename}_{file_size}"
+    return hashlib.md5(hash_input.encode()).hexdigest()[:10]
 
 
-def ensure_transcript(
-    video_path: str,
-    transcript_path: Optional[str],
-    work_dir: str,
-    language: str,
-    asr: Optional[ASRConfig] = None,
-) -> str:
-  """Return the SRT transcript path.
-
-  Priority:
-  1) user-provided --transcript
-  2) cached {work_dir}/{video_stem}.srt (if ASR config matches)
-  3) generate once
-  """
-  if transcript_path:
-    exists_or_raise(transcript_path, "transcript")
-    return transcript_path
-
-  asr = asr or ASRConfig()
-  os.makedirs(work_dir, exist_ok=True)
-
-  wav_path, srt_cache_path = cached_work_paths(video_path, work_dir)
-  meta_path = _asr_cache_meta_path(video_path, work_dir)
-
-  meta = _load_json(meta_path) or {}
-  want = {"backend": asr.backend, "model": asr.model, "device": asr.device, "compute_type": asr.compute_type, "threads": int(asr.threads)}
-  meta_ok = meta.get("asr") == want
-
-  # Reuse cached SRT if present AND ASR config matches
-  if os.path.exists(srt_cache_path) and meta_ok:
-    print(f"Reusing existing transcript: {srt_cache_path}")
-    return srt_cache_path
-
-  # Reuse cached WAV if present; otherwise extract once
-  if os.path.exists(wav_path):
-    print(f"Reusing existing WAV: {wav_path}")
-  else:
-    extract_audio_wav(video_path, wav_path)
-
-  base_name = os.path.splitext(os.path.basename(srt_cache_path))[0]
-
-  backend = asr.backend
-  if backend == "auto":
-    # Prefer faster-whisper if available
-    try:
-      import faster_whisper  # noqa: F401
-      backend = "faster-whisper"
-    except Exception:
-      backend = "whispercpp"
-
-  if backend == "faster-whisper":
-    # Generate directly to cache path
-    run_faster_whisper_to_srt(
-      wav_path=wav_path,
-      srt_path=srt_cache_path,
-      language=language,
-      model=asr.model,
-      device=asr.device,
-      compute_type=asr.compute_type,
-    )
-    _write_json(meta_path, {"video": video_path, "asr": want, "ts": int(time.time())})
-    return srt_cache_path
-
-  # whispercpp
-  srt_path = run_whisper_to_srt(
-    wav_path=wav_path,
-    out_dir=work_dir,
-    language=language,
-    threads=int(asr.threads),
-    use_vad=True,
-    base_name=base_name,
-  )
-
-  if os.path.abspath(srt_path) != os.path.abspath(srt_cache_path):
-    try:
-      with open(srt_path, "r", encoding="utf-8", errors="ignore") as src, open(srt_cache_path, "w", encoding="utf-8") as dst:
-        dst.write(src.read())
-      srt_path = srt_cache_path
-    except Exception:
-      pass
-
-  _write_json(meta_path, {"video": video_path, "asr": want, "ts": int(time.time())})
-  return srt_path
+def sanitize_filename(filename: str) -> str:
+    """Sanitize a string to be used as a filename."""
+    # Remove invalid characters
+    s = re.sub(r'[\\/*?:"<>|]', "", filename)
+    # Replace spaces with underscores
+    s = s.replace(' ', '_')
+    # Limit length
+    return s[:100]
 
 
-# ----------------------------
-# Engagement scoring
-# ----------------------------
-ENGAGEMENT_NAMES_BOOST = 1.0
+def escape_text_for_ffmpeg(text: str) -> str:
+    """Escape text for FFmpeg drawtext filter."""
+    # Escape special characters
+    text = text.replace("'", "\\'").replace(':', '\\:').replace(',', '\\,')
+    return text
 
 
-def transcript_name_list(segs: List[Segment]) -> List[str]:
-  """Heuristic extraction of important 'names' from transcript.
+# ==========================================
+# 4. Text Processing (Hooks/Punchlines)
+# ==========================================
 
-  Without NER, we approximate by:
-  - tokens that appear often
-  - length >= 3
-  - not in stopwords
-  """
-  freq: Dict[str, int] = {}
-  for s in segs:
-    for t in tokenize(s.text):
-      if t in STOPWORDS or len(t) < 3:
-        continue
-      freq[t] = freq.get(t, 0) + 1
-  # keep top frequent terms, but not too many
-  ranked = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)
-  top = [w for (w, c) in ranked[:25] if c >= 3]
-  return top
+def _smart_extract(text: str, mode: str) -> str:
+    """Heuristic extraction for hooks and punchlines."""
+    # Split by punctuation
+    sentences = re.split(r'(?<=[.!?。！？])\s*', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 2]
 
+    if not sentences: return text[:50]
 
-def estimate_dialogue_score(text: str, names: List[str]) -> float:
-  toks = tokenize(text)
-  if not toks:
-    return 0.0
-  words = [t for t in toks if t not in STOPWORDS]
-  # dialogue tends to have more words and more unique content
-  richness = keyword_richness(text)
-  density = content_density(text)
-  # boost for important names/terms
-  hits = 0
-  if names:
-    s = " " + " ".join(toks) + " "
-    for nm in names:
-      if f" {nm} " in s:
-        hits += 1
-  name_boost = clamp(hits / max(1, len(names) / 5), 0.0, 1.0)
-  score = 0.45 * density + 0.35 * richness + 0.20 * name_boost
-  # small boost for longer speech blocks (without going crazy)
-  score *= clamp(len(words) / 120.0, 0.6, 1.2)
-  return clamp(score, 0.0, 1.0)
+    if mode == "hook":
+        # Strategy: Questions or Exclamations first
+        for s in sentences[:4]:
+            if any(p in s for p in ["?", "？"]) and len(s) < 60: return s
+        for s in sentences[:4]:
+            if any(p in s for p in ["!", "！"]) and len(s) < 50: return s
+        return sentences[0]
+
+    elif mode == "punchline":
+        # Strategy: Last sentence usually holds the conclusion
+        return sentences[-1] if len(sentences[-1]) < 80 else sentences[-1][:80]
+
+    return text
 
 
-def estimate_action_score(video_path: str, start: float, end: float, scene_cuts: List[float], silence_starts: List[float], silence_ends: List[float]) -> float:
-  """Estimate action intensity from:
-  - cut rate (cuts per second)
-  - low silence ratio (more continuous loudness)
-  - audio 'volume' proxy via ffmpeg astats (optional)
+def get_hook_punchline(text: str) -> Tuple[str, str]:
+    """Extract hook and punchline from text."""
+    # For Japanese content, we need special handling
+    is_japanese = any(unicodedata.east_asian_width(c) in ('F', 'W') for c in text)
 
-  Kept fairly light: only uses already computed cut/silence features.
-  """
-  dur = max(0.1, end - start)
-  cuts_in = [t for t in scene_cuts if start <= t <= end]
-  cut_rate = clamp((len(cuts_in) / dur) / 0.25, 0.0, 1.0)  # ~1 cut/4s -> 1.0
+    if is_japanese:
+        # Japanese content typically has shorter sentences
+        # Just use first and last parts directly
+        parts = text.split('。')
+        if len(parts) >= 2:
+            hook = parts[0] + '。' if not parts[0].endswith('。') else parts[0]
+            punchline = parts[-1]
+            return hook, punchline
 
-  # Estimate silence fraction from boundaries (approx)
-  sil_spans: List[Tuple[float, float]] = []
-  for ss, se in zip(silence_starts, silence_ends):
-    if se <= ss:
-      continue
-    if se < start or ss > end:
-      continue
-    sil_spans.append((max(start, ss), min(end, se)))
-  sil_total = sum(max(0.0, b - a) for a, b in sil_spans)
-  non_sil = clamp(1.0 - (sil_total / dur), 0.0, 1.0)
-
-  return clamp(0.65 * cut_rate + 0.35 * non_sil, 0.0, 1.0)
+    # Default extraction for other languages
+    return _smart_extract(text, "hook"), _smart_extract(text, "punchline")
 
 
-def score_candidate_engagement(
-    c: Candidate,
-    mode: str,
-    names: List[str],
-    video_path: str,
-    scene_cuts: List[float],
-    silence_starts: List[float],
-    silence_ends: List[float],
-) -> float:
-  base_text = score_candidate_text_only(c)
-  dialogue = estimate_dialogue_score(c.text, names)
-  action = estimate_action_score(video_path, c.start, c.end, scene_cuts, silence_starts, silence_ends)
+# ==========================================
+# 5. FFmpeg Filter Construction
+# ==========================================
 
-  if mode == "action":
-    score = 0.20 * base_text + 0.30 * dialogue + 0.50 * action
-  elif mode == "dialogue":
-    score = 0.20 * base_text + 0.65 * dialogue + 0.15 * action
-  else:  # balanced
-    score = 0.20 * base_text + 0.45 * dialogue + 0.35 * action
+def build_filter_chain(clip: Candidate, idx: int, cfg: argparse.Namespace, resolution: Tuple[int, int]) -> str:
+    target_w, target_h = resolution
+    filters = []
 
-  return clamp(score, 0.0, 1.0)
-
-
-# ----------------------------
-# Aspect ratio formatting (crop/pad)
-# ----------------------------
-ASPECT_PRESETS: Dict[str, Tuple[int, int]] = {
-  "source": (0, 0),
-  "16:9": (16, 9),
-  "9:16": (9, 16),
-  "1:1": (1, 1),
-  "4:5": (4, 5),
-  "21:9": (21, 9),
-}
-
-
-def _parse_target_res(s: str) -> Optional[Tuple[int, int]]:
-  if not s:
-    return None
-  m = re.match(r"^\s*(\d{2,5})\s*[xX]\s*(\d{2,5})\s*$", s)
-  if not m:
-    raise ValueError("--target-res must look like 1080x1920")
-  w = int(m.group(1))
-  h = int(m.group(2))
-  if w <= 0 or h <= 0:
-    raise ValueError("--target-res must be positive")
-  return w, h
-
-
-def build_vf_chain(
-    *,
-    aspect: str,
-    mode: str,
-    target_res: Optional[Tuple[int, int]],
-) -> Optional[str]:
-  """Build a safe vf chain for aspect enforcement + optional final scaling.
-
-  - aspect=source: no crop/pad; only scale if target_res is set.
-  - mode=fit: pad to aspect (no crop)
-  - mode=fill: center crop to aspect
-  - mode=smart is handled externally per-clip (call with fit/fill)
-  """
-  vf_parts: List[str] = []
-
-  if aspect != "source":
-    if aspect not in ASPECT_PRESETS:
-      return None
-    aw, ah = ASPECT_PRESETS[aspect]
-    if aw <= 0 or ah <= 0:
-      return None
-
-    target = f"{aw}/{ah}"
-
-    # Use explicit intermediate vars so crop/pad math is correct.
-    if mode == "fill":
-      crop_w = f"if(gt(iw/ih,({target})),ih*({target}),iw)"
-      crop_h = f"if(gt(iw/ih,({target})),ih,iw/({target}))"
-      vf_parts.append(f"crop=w='{crop_w}':h='{crop_h}':x='(iw-{crop_w})/2':y='(ih-{crop_h})/2'")
+    # 1. Scale/Crop
+    if cfg.aspect_mode == "fill":
+        filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}")
     else:  # fit
-      pad_w = f"if(gt(iw/ih,({target})),iw,ih*({target}))"
-      pad_h = f"if(gt(iw/ih,({target})),iw/({target}),ih)"
-      vf_parts.append(
-        f"pad=w='{pad_w}':h='{pad_h}':x='(ow-iw)/2':y='(oh-ih)/2':color=black"
-      )
-
-  # Optional: scale to exact output size.
-  if target_res is not None:
-    tw, th = target_res
-    vf_parts.append(f"scale={tw}:{th}")
-
-  # Normalize SAR at end (avoids weird display aspect on some players).
-  if vf_parts:
-    vf_parts.append("setsar=1")
-    return ",".join(vf_parts)
-
-  return None
-
-
-# ----------------------------
-# Export (safe re-encode)
-# ----------------------------
-def _export_clip_once(
-    video_path: str,
-    start: float,
-    end: float,
-    out_path: str,
-    v_encoder: str,
-    preset: str,
-    crf_or_cq: int,
-    use_hw_decode: bool,
-    vf: Optional[str],
-) -> None:
-  args: List[str] = [FFMPEG, "-y", "-hide_banner", "-v", "error"]
-
-  if use_hw_decode:
-    if ffmpeg_supports_hwaccel("cuda"):
-      args += ["-hwaccel", "cuda"]
-
-  args += [
-    "-ss", f"{start:.3f}",
-    "-to", f"{end:.3f}",
-    "-i", video_path,
-  ]
-
-  if vf:
-    args += ["-vf", vf]
-
-  # Video
-  if v_encoder == "h264_nvenc":
-    args += [
-      "-c:v", "h264_nvenc",
-      "-preset", preset,
-      "-rc", "vbr",
-      "-cq", str(int(crf_or_cq)),
-      "-b:v", "0",
-      "-pix_fmt", "yuv420p",
-    ]
-  else:
-    # High quality but still fast-ish. Use a sane GOP to help social platforms.
-    args += [
-      "-c:v", "libx264",
-      "-preset", preset,
-      "-crf", str(int(crf_or_cq)),
-      "-pix_fmt", "yuv420p",
-      "-movflags", "+faststart",
-    ]
-
-  args += [
-    "-c:a", "aac",
-    "-b:a", "192k",
-    out_path,
-  ]
-  run(args)
-
-
-def export_clip_reencode(
-    video_path: str,
-    start: float,
-    end: float,
-    out_path: str,
-    prefer_gpu: bool = False,
-    use_hw_decode: bool = False,
-    vf: Optional[str] = None,
-    quality: str = "high",
-) -> None:
-  """Export one clip.
-
-  quality:
-    - high: preserve quality (default)
-    - fast: faster, slightly larger quality loss
-  """
-  if quality == "fast":
-    cpu_preset = "veryfast"
-    cpu_crf = 21
-    nvenc_preset = "p4"
-    nvenc_cq = 23
-  else:
-    cpu_preset = "faster"
-    cpu_crf = 18
-    nvenc_preset = "p5"
-    nvenc_cq = 21
-
-  if prefer_gpu and ffmpeg_supports_encoder("h264_nvenc"):
-    try:
-      _export_clip_once(
-        video_path=video_path,
-        start=start,
-        end=end,
-        out_path=out_path,
-        v_encoder="h264_nvenc",
-        preset=nvenc_preset,
-        crf_or_cq=nvenc_cq,
-        use_hw_decode=use_hw_decode,
-        vf=vf,
-      )
-      return
-    except subprocess.CalledProcessError as e:
-      print(f"NVENC export failed for {os.path.basename(out_path)}; retrying on CPU. Error: {e}")
-
-  _export_clip_once(
-    video_path=video_path,
-    start=start,
-    end=end,
-    out_path=out_path,
-    v_encoder="libx264",
-    preset=cpu_preset,
-    crf_or_cq=cpu_crf,
-    use_hw_decode=False,
-    vf=vf,
-  )
-
-
-def _export_job(job: Tuple[str, float, float, str, bool, bool, Optional[str], str]) -> str:
-  video_path, start, end, out_path, prefer_gpu, use_hw_decode, vf, quality = job
-  export_clip_reencode(
-    video_path,
-    start,
-    end,
-    out_path,
-    prefer_gpu=prefer_gpu,
-    use_hw_decode=use_hw_decode,
-    vf=vf,
-    quality=quality,
-  )
-  return out_path
-
-
-# ----------------------------
-# Boundary detection (scene cuts + silence)
-# ----------------------------
-def detect_scene_cuts(video_path: str, start: float, end: float, scene_thresh: float = 0.35) -> List[float]:
-  dur = max(0.1, end - start)
-  vf = f"select=gt(scene\\,{scene_thresh}),showinfo"
-  args = [
-    FFMPEG,
-    "-hide_banner",
-    "-v", "info",
-    "-ss", f"{start:.3f}",
-    "-t", f"{dur:.3f}",
-    "-i", video_path,
-    "-vf", vf,
-    "-f", "null",
-    "-",
-  ]
-
-  out = run_capture(args)
-  cuts: List[float] = []
-  for line in out.splitlines():
-    m = re.search(r"pts_time:([0-9.]+)", line)
-    if m:
-      cuts.append(start + float(m.group(1)))
-
-  return sorted(set(round(t, 3) for t in cuts))
-
-
-def detect_silence_boundaries(
-    video_path: str,
-    start: float,
-    end: float,
-    silence_db: float = -35.0,
-    min_silence_sec: float = 0.6
-) -> Tuple[List[float], List[float]]:
-  dur = max(0.1, end - start)
-  af = f"silencedetect=noise={silence_db}dB:d={min_silence_sec}"
-  args = [
-    FFMPEG,
-    "-hide_banner",
-    "-v", "error",
-    "-ss", f"{start:.3f}",
-    "-t", f"{dur:.3f}",
-    "-i", video_path,
-    "-af", af,
-    "-f", "null",
-    "-",
-  ]
-
-  out = run_capture(args)
-  s_starts: List[float] = []
-  s_ends: List[float] = []
-  for line in out.splitlines():
-    m1 = re.search(r"silence_start:\s*([0-9.]+)", line)
-    if m1:
-      s_starts.append(start + float(m1.group(1)))
-    m2 = re.search(r"silence_end:\s*([0-9.]+)", line)
-    if m2:
-      s_ends.append(start + float(m2.group(1)))
-
-  return (
-    sorted(set(round(t, 3) for t in s_starts)),
-    sorted(set(round(t, 3) for t in s_ends)),
-  )
-
-
-# ----------------------------
-# Candidate generation + snapping
-# ----------------------------
-STOPWORDS = set("""
-a an and are as at be but by for from has have he her hers him his i if in into is it its
-me my of on or our ours she that the their them they this to was we were what when where
-who why will with you your yours not do did done just so
-""".split())
-
-
-def content_density(text: str) -> float:
-  toks = tokenize(text)
-  if not toks:
-    return 0.0
-  content = [t for t in toks if t not in STOPWORDS and len(t) >= 4]
-  return clamp(len(content) / len(toks), 0.0, 1.0)
-
-
-def keyword_richness(text: str) -> float:
-  toks = [t for t in tokenize(text) if t not in STOPWORDS]
-  if not toks:
-    return 0.0
-  uniq = len(set(toks))
-  return clamp(uniq / max(1, len(toks)), 0.0, 1.0)
-
-
-def make_candidates_from_segments(
-    segs: List[Segment],
-    search_start: float,
-    search_end: float,
-    min_len: float,
-    max_len: float
-) -> List[Candidate]:
-  usable = [s for s in segs if s.end >= search_start and s.start <= search_end]
-  usable.sort(key=lambda s: s.start)
-
-  cands: List[Candidate] = []
-  n = len(usable)
-  for i in range(n):
-    start = max(usable[i].start, search_start)
-    text_parts = []
-    end = start
-
-    for j in range(i, n):
-      if usable[j].start < start:
-        continue
-      if usable[j].start > search_end:
-        break
-      end = usable[j].end
-      text_parts.append(usable[j].text)
-
-      dur = end - start
-      if dur >= min_len:
-        if dur <= max_len and end <= search_end:
-          cands.append(Candidate(start=start, end=end, text=" ".join(text_parts)))
-        if dur >= max_len:
-          break
-
-  seen = set()
-  uniq: List[Candidate] = []
-  for c in cands:
-    k = (round(c.start, 2), round(c.end, 2))
-    if k in seen:
-      continue
-    seen.add(k)
-    uniq.append(c)
-  return uniq
-
-
-def nearest_within(ts: float, points: List[float], window: float) -> Optional[float]:
-  best = None
-  best_d = 1e18
-  for p in points:
-    d = abs(p - ts)
-    if d <= window and d < best_d:
-      best = p
-      best_d = d
-  return best
-
-
-def snap_clip(
-    start: float,
-    end: float,
-    scene_cuts: List[float],
-    silence_starts: List[float],
-    silence_ends: List[float],
-    subtitle_bounds: List[float],
-    snap_scene_sec: float = 1.5,
-    snap_silence_sec: float = 2.0,
-    snap_sub_sec: float = 1.0,
-) -> Tuple[float, float]:
-  s = start
-  e = end
-
-  s2 = nearest_within(s, scene_cuts, snap_scene_sec) or \
-       nearest_within(s, silence_ends, snap_silence_sec) or \
-       nearest_within(s, subtitle_bounds, snap_sub_sec)
-  if s2 is not None:
-    s = s2
-
-  e2 = nearest_within(e, scene_cuts, snap_scene_sec) or \
-       nearest_within(e, silence_starts, snap_silence_sec) or \
-       nearest_within(e, subtitle_bounds, snap_sub_sec)
-  if e2 is not None:
-    e = e2
-
-  if e <= s:
-    return start, end
-  return s, e
-
-
-def score_candidate_text_only(c: Candidate) -> float:
-  dens = content_density(c.text)
-  rich = keyword_richness(c.text)
-  return clamp(0.6 * dens + 0.4 * rich, 0.0, 1.0)
-
-
-def overlap_ratio(a: Candidate, b: Candidate) -> float:
-  inter = max(0.0, min(a.end, b.end) - max(a.start, b.start))
-  union = max(a.end, b.end) - min(a.start, b.start)
-  return 0.0 if union <= 0 else inter / union
-
-
-def select_top_n(cands: List[Candidate], n: int, max_overlap_ratio: float = 0.50) -> List[Candidate]:
-  cands = sorted(cands, key=lambda x: x.score, reverse=True)
-  picked: List[Candidate] = []
-  for c in cands:
-    if len(picked) >= n:
-      break
-    if any(overlap_ratio(c, p) > max_overlap_ratio for p in picked):
-      continue
-    picked.append(c)
-  return picked
-
-
-# ----------------------------
-# ffmpeg/ffprobe resolution helpers (must be defined before main)
-# ----------------------------
-
-def _find_gyan_winget_ffmpeg_bin() -> Optional[str]:
-  """Best-effort: locate the Winget Gyan FFmpeg bin folder on Windows."""
-  la = os.environ.get("LOCALAPPDATA")
-  if not la:
-    return None
-  root = os.path.join(la, "Microsoft", "WinGet", "Packages")
-  if not os.path.isdir(root):
-    return None
-
-  try:
-    for name in os.listdir(root):
-      if not name.lower().startswith("gyan.ffmpeg"):
-        continue
-      pkg_dir = os.path.join(root, name)
-      if not os.path.isdir(pkg_dir):
-        continue
-      for child in os.listdir(pkg_dir):
-        if not child.lower().startswith("ffmpeg-"):
-          continue
-        bin_dir = os.path.join(pkg_dir, child, "bin")
-        if os.path.exists(os.path.join(bin_dir, "ffmpeg.exe")) and os.path.exists(os.path.join(bin_dir, "ffprobe.exe")):
-          return bin_dir
-  except Exception:
-    return None
-
-  return None
-
-
-def resolve_ffmpeg_tools() -> Tuple[str, str]:
-  """Resolve (ffmpeg, ffprobe) paths with env/PATH + common Windows installs."""
-  extra: List[str] = []
-  gyan_bin = _find_gyan_winget_ffmpeg_bin()
-  if gyan_bin:
-    extra = [os.path.join(gyan_bin, "ffmpeg.exe"), os.path.join(gyan_bin, "ffprobe.exe")]
-
-  ffmpeg = resolve_exe(
-    env_var="ANIMECLIPS_FFMPEG",
-    default_names=["ffmpeg", "ffmpeg.exe"],
-    label="ffmpeg",
-    extra_candidates=extra,
-  )
-  ffprobe = resolve_exe(
-    env_var="ANIMECLIPS_FFPROBE",
-    default_names=["ffprobe", "ffprobe.exe"],
-    label="ffprobe",
-    extra_candidates=extra,
-  )
-  return ffmpeg, ffprobe
-
-
-# ----------------------------
-# FFmpeg capability probing
-# ----------------------------
-
-def _cmd_exists(path: str) -> bool:
-  try:
-    return bool(path) and os.path.exists(path)
-  except Exception:
-    return False
-
-
-def ffmpeg_supports_encoder(encoder: str) -> bool:
-  if not _cmd_exists(FFMPEG):
-    return False
-  try:
-    out = run_capture([FFMPEG, "-hide_banner", "-encoders"])
-    return re.search(rf"\b{re.escape(encoder)}\b", out) is not None
-  except Exception:
-    return False
-
-
-def ffmpeg_supports_hwaccel(hwaccel: str) -> bool:
-  if not _cmd_exists(FFMPEG):
-    return False
-  try:
-    out = run_capture([FFMPEG, "-hide_banner", "-hwaccels"])
-    return re.search(rf"\b{re.escape(hwaccel)}\b", out) is not None
-  except Exception:
-    return False
-
-
-# ----------------------------
-# CUDA/cuDNN helpers
-# ----------------------------
-
-def _windows_has_cudnn_on_path(dll_names: Optional[List[str]] = None) -> bool:
-  """Return True if cuDNN DLLs appear discoverable via PATH on Windows.
-
-  faster-whisper/ctranslate2 loads cuDNN dynamically; if the DLLs are not on PATH
-  it can crash the process (not always a clean Python exception).
-  """
-  if os.name != "nt":
-    return True
-  dlls = dll_names or ["cudnn_ops64_9.dll", "cudnn_cnn64_9.dll", "cudnn64_9.dll"]
-  path = os.environ.get("PATH") or ""
-  parts = [p.strip().strip('"') for p in path.split(os.pathsep) if p.strip()]
-  for d in dlls:
-    found = False
-    for p in parts:
-      try:
-        if os.path.exists(os.path.join(p, d)):
-          found = True
-          break
-      except Exception:
-        continue
-    if not found:
-      return False
-  return True
-
-
-def exists_or_raise(path: str, label: str) -> None:
-  if not os.path.exists(path):
-    raise FileNotFoundError(f"{label} not found: {path}")
-
-
-# ----------------------------
-# Main
-# ----------------------------
+        filters.append(
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black")
+
+    # 2. Overlay
+    if cfg.template_style:
+        tpl = OVERLAY_TEMPLATES.get(cfg.template_style, OVERLAY_TEMPLATES["simple"])
+        hook, punchline = get_hook_punchline(clip.text)
+
+        # Format text with emojis (only once)
+        try:
+            top_txt = cfg.overlay_top_text.format(hook=hook, punchline=punchline, channel=cfg.channel_name, i=idx)
+            bot_txt = cfg.overlay_bottom_text.format(hook=hook, punchline=punchline, channel=cfg.channel_name, i=idx)
+
+            # Add emojis only once
+            if tpl.emoji_prefix and not top_txt.startswith(tpl.emoji_prefix):
+                top_txt = f"{tpl.emoji_prefix}{top_txt}"
+            if tpl.emoji_suffix and not top_txt.endswith(tpl.emoji_suffix):
+                top_txt = f"{top_txt}{tpl.emoji_suffix}"
+        except:
+            top_txt, bot_txt = hook, punchline
+
+        # Escape text for FFmpeg
+        top_txt_escaped = escape_text_for_ffmpeg(top_txt)
+        bot_txt_escaped = escape_text_for_ffmpeg(bot_txt)
+
+        # Check if text contains Japanese/CJK characters
+        has_cjk = any(unicodedata.east_asian_width(c) in ('F', 'W') for c in top_txt + bot_txt)
+
+        # Get appropriate font for text content (especially for CJK characters)
+        font_path = get_system_font_path(cfg.overlay_font)
+        if not font_path and has_cjk:
+            # If text contains CJK characters and no font specified, try to find a suitable one
+            font_path = get_system_font_path("Noto Sans CJK")
+
+        # Fix the font path format for FFmpeg
+        if font_path:
+            font_path = font_path.replace('\\', '/').replace(':', '\\:')
+            font_arg = f":fontfile='{font_path}'"
+        else:
+            font_arg = ""
+
+        # Adjust font size based on content type
+        fs_base = int(target_h * 0.05)  # Base font size
+        if has_cjk:
+            fs_base = int(target_h * 0.04)  # Smaller for CJK characters
+
+        # Bars - improved positioning
+        if tpl.use_gradient:
+            c1, c2 = tpl.gradient_colors
+            filters.append(f"drawbox=x=0:y=0:w=iw:h={int(target_h * 0.18)}:color={c1}@0.9:t=fill")
+            filters.append(f"drawbox=x=0:y={int(target_h * 0.82)}:w=iw:h={int(target_h * 0.18)}:color={c2}@0.9:t=fill")
+        else:
+            if tpl.top_bar_opacity > 0:
+                filters.append(
+                    f"drawbox=x=0:y=0:w=iw:h={int(target_h * 0.18)}:color={tpl.top_bar_color}@{tpl.top_bar_opacity}:t=fill")
+            if tpl.bottom_bar_opacity > 0:
+                filters.append(
+                    f"drawbox=x=0:y={int(target_h * 0.82)}:w=iw:h={int(target_h * 0.18)}:color={tpl.bottom_bar_color}@{tpl.bottom_bar_opacity}:t=fill")
+
+        # Text - improved positioning and styling
+        if tpl.text_style == "outline":
+            border = f":borderw={tpl.border_width}:bordercolor=black"
+        elif tpl.text_style == "glow":
+            border = f":shadowx=0:shadowy=0:shadowcolor=black@0.8:box=1:boxcolor=black@0.2:boxborderw=5"
+        else:  # shadow
+            border = ":shadowx=2:shadowy=2:shadowcolor=black@0.8"
+
+        # Fix the vertical positioning - use fixed pixel values instead of expressions
+        top_y_pos = int(target_h * 0.09)  # 9% of height
+        bottom_y_pos = int(target_h * 0.91)  # 91% of height
+
+        # Top text - centered with fixed vertical positioning
+        filters.append(
+            f"drawtext=text='{top_txt_escaped}'{font_arg}:fontcolor={tpl.text_color}:fontsize={fs_base}"
+            f"{border}:x=(w-text_w)/2:y={top_y_pos}:line_spacing=5")
+
+        # Bottom text - centered with fixed vertical positioning
+        filters.append(
+            f"drawtext=text='{bot_txt_escaped}'{font_arg}:fontcolor={tpl.text_color}:fontsize={int(fs_base * 0.9)}"
+            f"{border}:x=(w-text_w)/2:y={bottom_y_pos}-text_h:line_spacing=5")
+
+    return ",".join(filters)
+
+
+# ==========================================
+# 6. Main Logic
+# ==========================================
+
+def run_ffmpeg(args):
+    cmd, log = args
+    with open(log, "w") as f: subprocess.run(cmd, stdout=f, stderr=f)
+
 
 def main():
-  ap = argparse.ArgumentParser(description="Generate N important, sensible clips from a video (auto transcript if missing).")
-  ap.add_argument("--video", required=True, help="Input video path (mkv/mp4).")
-  ap.add_argument("--num-clips", type=int, required=True, help="How many clips to generate.")
-  ap.add_argument("--transcript", default=None, help="Optional SRT transcript path.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video", required=True)
+    parser.add_argument("--outdir", required=True)
+    parser.add_argument("--workdir", default="work")
+    parser.add_argument("--transcript", help="SRT path")
+    parser.add_argument("--transcript-output", help="Where to save the transcript")
+    parser.add_argument("--output-prefix", help="Prefix for output filenames")
 
-  ap.add_argument("--skip-intro-sec", type=float, default=0.0, help="Seconds to skip from the start.")
-  ap.add_argument("--skip-outro-sec", type=float, default=0.0, help="Seconds to skip from the end.")
+    # Whisper Settings
+    parser.add_argument("--whisper-model", default="small", choices=["small", "medium", "large"])
+    parser.add_argument("--language", default="auto", choices=["auto", "english", "japanese"])
 
-  ap.add_argument("--len-preset", choices=["60-90", "60-120"], default="60-90")
-  ap.add_argument("--outdir", default="out_clips", help="Output folder.")
-  ap.add_argument("--workdir", default="work", help="Working folder (audio + generated transcripts).")
+    # Clip Settings
+    parser.add_argument("--num-clips", type=int, default=5)
+    parser.add_argument("--skip-intro", type=float, default=0)
+    parser.add_argument("--skip-outro", type=float, default=0)
 
-  ap.add_argument("--language", default="auto", help="Whisper language: auto/en/ja/etc.")
-  ap.add_argument("--scene-thresh", type=float, default=0.35, help="Scene cut threshold; lower => more cuts.")
-  ap.add_argument("--silence-db", type=float, default=-35.0)
-  ap.add_argument("--min-silence-sec", type=float, default=0.6)
+    # Export Settings
+    parser.add_argument("--target-res", default="1080x1920")
+    parser.add_argument("--aspect-mode", default="fit")
+    parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--encoder", default="auto")
 
-  ap.add_argument(
-    "--engagement",
-    choices=["balanced", "action", "dialogue"],
-    default="balanced",
-    help="How to prioritize highlights: action, dialogue, or balanced mix.",
-  )
+    # Overlay
+    parser.add_argument("--template-style", default="viral_shorts")
+    parser.add_argument("--channel-name", default="")
+    parser.add_argument("--overlay-font", default="Arial")
+    parser.add_argument("--overlay-top-text", default="{hook}")
+    parser.add_argument("--overlay-bottom-text", default="{punchline}")
 
-  ap.add_argument(
-    "--aspect",
-    choices=list(ASPECT_PRESETS.keys()),
-    default="source",
-    help="Output aspect ratio (source keeps original).",
-  )
-  ap.add_argument(
-    "--aspect-mode",
-    choices=["fit", "fill", "smart"],
-    default="smart",
-    help="fit=pad (no crop), fill=center crop, smart=auto per-clip.",
-  )
-  ap.add_argument(
-    "--target-res",
-    default="",
-    help="Optional output resolution like 1080x1920. If set, clips will be scaled to exactly this size.",
-  )
+    args = parser.parse_args()
 
-  # --- Overlays for padded vertical clips ---
-  ap.add_argument(
-    "--overlay",
-    choices=["off", "auto", "on"],
-    default="auto",
-    help="Add attention text/bars to padded clips: off/auto/on.",
-  )
-  ap.add_argument(
-    "--overlay-style",
-    choices=["bars", "shorts"],
-    default="bars",
-    help="Overlay style when --overlay is active: bars=black bars top/bottom, shorts=outlined caption (like Shorts/TikTok).",
-  )
-  ap.add_argument(
-    "--overlay-bar-pct",
-    type=float,
-    default=0.14,
-    help="Bar height as fraction of output height (e.g., 0.14).",
-  )
-  ap.add_argument(
-    "--overlay-top-pad-pct",
-    type=float,
-    default=0.06,
-    help="For overlay-style=shorts: top padding as fraction of height.",
-  )
-  ap.add_argument(
-    "--overlay-bottom-pad-pct",
-    type=float,
-    default=0.10,
-    help="For overlay-style=shorts: bottom padding as fraction of height.",
-  )
-  ap.add_argument(
-    "--overlay-top-text",
-    default="{hook}",
-    help="Top overlay text template. Supports {desc}, {hook}, {punchline}, and {i}.",
-  )
-  ap.add_argument(
-    "--overlay-bottom-text",
-    default="{punchline}",
-    help="Bottom overlay text template. Supports {desc}, {hook}, {punchline}, and {i}.",
-  )
-  ap.add_argument(
-    "--overlay-font",
-    default=os.environ.get("ANIMECLIPS_OVERLAY_FONT", "Arial"),
-    help="Font family name or path to a .ttf/.otf file.",
-  )
-  ap.add_argument(
-    "--overlay-fontsize",
-    type=int,
-    default=56,
-    help="Base font size (scaled with target-res height if set).",
-  )
-  ap.add_argument(
-    "--overlay-borderw",
-    type=int,
-    default=10,
-    help="For overlay-style=shorts: outline thickness (drawtext borderw).",
-  )
-  ap.add_argument(
-    "--overlay-bordercolor",
-    default="black",
-    help="For overlay-style=shorts: outline color (drawtext bordercolor).",
-  )
-  ap.add_argument(
-    "--overlay-shadowx",
-    type=int,
-    default=2,
-    help="For overlay-style=shorts: shadow offset x.",
-  )
-  ap.add_argument(
-    "--overlay-shadowy",
-    type=int,
-    default=2,
-    help="For overlay-style=shorts: shadow offset y.",
-  )
+    try:
+        global FFMPEG
+        FFMPEG = resolve_exe("ffmpeg")
+    except:
+        print("Error: FFmpeg not found.")
+        sys.exit(1)
 
-  ap.add_argument(
-    "--quality",
-    choices=["high", "fast"],
-    default="high",
-    help="Encoding quality target.",
-  )
+    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(args.workdir, exist_ok=True)
 
-  ap.add_argument(
-    "--jobs",
-    type=int,
-    default=max(1, min(4, (os.cpu_count() or 4))),
-    help="Parallel clip export workers (default: up to 4).",
-  )
-  ap.add_argument(
-    "--encoder",
-    choices=["cpu", "nvenc", "auto"],
-    default="auto",
-    help="Video encoder: cpu=libx264, nvenc=h264_nvenc, auto=nvenc if available else cpu.",
-  )
-  ap.add_argument(
-    "--hw-decode",
-    action="store_true",
-    help="Try hardware decode (CUDA) when using NVENC.",
-  )
+    # Get video info for naming
+    video_basename = os.path.basename(args.video)
+    video_name = os.path.splitext(video_basename)[0]
+    video_hash = get_video_hash(args.video)
 
-  ap.add_argument(
-    "--asr-backend",
-    choices=["auto", "whispercpp", "faster-whisper"],
-    default="auto",
-    help="ASR backend. auto prefers faster-whisper if installed, else whisper.cpp.",
-  )
-  ap.add_argument(
-    "--asr-model",
-    default="small",
-    help="ASR model name (faster-whisper). Examples: tiny/base/small/medium/large-v3.",
-  )
-  ap.add_argument(
-    "--asr-device",
-    choices=["auto", "cpu", "cuda"],
-    default="auto",
-    help="ASR device for faster-whisper (cpu/cuda).",
-  )
-  ap.add_argument(
-    "--asr-compute-type",
-    default="auto",
-    help="ASR compute type for faster-whisper (auto/float16/int8/int8_float16/etc.).",
-  )
-  ap.add_argument(
-    "--asr-threads",
-    type=int,
-    default=6,
-    help="Threads for whisper.cpp backend.",
-  )
+    # Set output prefix if not provided
+    if not args.output_prefix:
+        args.output_prefix = sanitize_filename(video_name)
 
-  args = ap.parse_args()
+    # Check for anime content and set appropriate template and font
+    if "anime" in video_name.lower() or "naruto" in video_name.lower() or "manga" in video_name.lower():
+        print(f"Anime content detected, using anime template")
+        args.template_style = "anime"
+        args.overlay_font = "Noto Sans CJK JP"  # Better for Japanese text
 
-  # Resolve tools now (portable)
-  global FFMPEG, FFPROBE
-  FFMPEG, FFPROBE = resolve_ffmpeg_tools()
+    # Auto-detect language from audio if set to auto
+    if args.language == "auto":
+        print("Analyzing audio to detect language...")
+        detected_language = detect_audio_language(args.video)
+        if detected_language != "auto":
+            args.language = detected_language
+            print(f"Auto-detected language from audio: {args.language}")
 
-  exists_or_raise(args.video, "video")
-  exists_or_raise(FFMPEG, "ffmpeg")
-  exists_or_raise(FFPROBE, "ffprobe")
+    # 1. Handle Transcript / Whisper
+    srt_file = args.transcript
 
-  os.makedirs(args.outdir, exist_ok=True)
-  video_out_dir = os.path.join(args.outdir, safe_basename_no_ext(args.video))
-  os.makedirs(video_out_dir, exist_ok=True)
+    if not srt_file or not os.path.exists(srt_file):
+        # Check if transcript output path is specified
+        transcript_output = args.transcript_output
 
-  dur = ffprobe_duration(args.video)
-  search_start = clamp(args.skip_intro_sec, 0.0, dur)
-  search_end = clamp(dur - args.skip_outro_sec, search_start + 1.0, dur)
+        # Check if SRT already exists next to video
+        potential_srt = os.path.splitext(args.video)[0] + ".srt"
+        if os.path.exists(potential_srt):
+            print(f"Found existing transcript: {potential_srt}")
+            srt_file = potential_srt
+        else:
+            # Check if there's a transcript in the workdir with the video hash
+            work_transcript = os.path.join(args.workdir, f"{video_hash}.srt")
+            if os.path.exists(work_transcript):
+                print(f"Found existing transcript in workdir: {work_transcript}")
+                srt_file = work_transcript
+            else:
+                # Need to transcribe
+                print(f"No transcript found. Initializing Whisper ({args.whisper_model})...")
 
-  target_res = _parse_target_res(args.target_res)
+                # Save transcript in the output directory
+                transcript_output = os.path.join(args.outdir, f"{args.output_prefix}_transcript.srt")
 
-  asr_cfg = ASRConfig(
-    backend=args.asr_backend,
-    model=args.asr_model,
-    device=args.asr_device,
-    compute_type=args.asr_compute_type,
-    threads=int(args.asr_threads),
-  )
+                # Transcribe the video
+                srt_file = transcribe_video(video_path=args.video,
+                                            model_size=args.whisper_model,
+                                            language=args.language,
+                                            transcript_output=transcript_output)
 
-  transcript_path = ensure_transcript(args.video, args.transcript, args.workdir, args.language, asr=asr_cfg)
-  segs = load_srt(transcript_path)
-  if not segs:
-    raise RuntimeError(f"Transcript parsed 0 segments: {transcript_path}")
+                # No need to make a duplicate copy
+                print(f"Transcript saved to output directory")
 
-  if args.len_preset == "60-90":
-    min_len, max_len = 60.0, 90.0
-  else:
-    min_len, max_len = 60.0, 120.0
+    # 2. Parse & Select Clips
+    candidates = parse_srt(srt_file)
+    if not candidates:
+        print("Transcript empty or invalid. Falling back to time-segmentation.")
+        # Fallback logic - use video duration if available
+        duration = get_video_duration(args.video)
+        if duration <= 0:
+            duration = 1400  # Default to ~23 minutes for anime episodes
 
-  scene_cuts = detect_scene_cuts(args.video, search_start, search_end, scene_thresh=args.scene_thresh)
-  silence_starts, silence_ends = detect_silence_boundaries(
-    args.video, search_start, search_end,
-    silence_db=args.silence_db, min_silence_sec=args.min_silence_sec
-  )
-  subtitle_bounds = sorted(set(round(s.end, 3) for s in segs if search_start <= s.end <= search_end))
+        # Create segments of 60 seconds each
+        segment_duration = 60
+        candidates = [
+            Candidate(i * segment_duration, (i + 1) * segment_duration, f"Clip {i + 1}")
+            for i in range(min(args.num_clips, int(duration // segment_duration)))
+        ]
 
-  cands = make_candidates_from_segments(segs, search_start, search_end, min_len=min_len, max_len=max_len)
-  if not cands:
-    raise RuntimeError("No candidates generated. Try len preset 60-120 or reduce intro/outro skip.")
+    # Skip intro if specified
+    if args.skip_intro > 0:
+        print(f"Skipping first {args.skip_intro} seconds (intro)")
+        candidates = [c for c in candidates if c.start >= args.skip_intro]
 
-  names = transcript_name_list(segs)
-  for c in cands:
-    c.score = score_candidate_engagement(
-      c,
-      mode=args.engagement,
-      names=names,
-      video_path=args.video,
-      scene_cuts=scene_cuts,
-      silence_starts=silence_starts,
-      silence_ends=silence_ends,
-    )
+    # Simple Selection (In real usage, you'd score them here)
+    # We filter out very short segments or merge them
+    # For now, we group segments into 60s chunks roughly
+    final_clips = []
+    current_chunk = []
+    current_dur = 0
 
-  snapped = []  # type: List[Candidate]
-  for c in cands:
-    s, e = snap_clip(
-      c.start, c.end,
-      scene_cuts=scene_cuts,
-      silence_starts=silence_starts,
-      silence_ends=silence_ends,
-      subtitle_bounds=subtitle_bounds,
-    )
-    if (e - s) < (min_len * 0.80) or (e - s) > (max_len * 1.20):
-      continue
-    snapped.append(Candidate(start=s, end=e, text=c.text, score=c.score))
+    for cand in candidates:
+        dur = cand.end - cand.start
+        if current_dur + dur < 60:
+            current_chunk.append(cand)
+            current_dur += dur
+        else:
+            # Finalize chunk
+            if current_chunk:
+                start = current_chunk[0].start
+                end = current_chunk[-1].end
+                text = " ".join([c.text for c in current_chunk])
+                final_clips.append(Candidate(start, end, text))
+            current_chunk = [cand]
+            current_dur = dur
 
-  if not snapped:
-    raise RuntimeError("All candidates filtered out after snapping. Try 60-120 preset or relax thresholds.")
+    # Add the last chunk if not empty
+    if current_chunk:
+        start = current_chunk[0].start
+        end = current_chunk[-1].end
+        text = " ".join([c.text for c in current_chunk])
+        final_clips.append(Candidate(start, end, text))
 
-  picked = select_top_n(snapped, n=args.num_clips, max_overlap_ratio=0.50)
+    selected = final_clips[:args.num_clips]
+    print(f"Selected {len(selected)} clips for export.")
 
-  debug_path = os.path.join(video_out_dir, "picked.json")
-  with open(debug_path, "w", encoding="utf-8") as f:
-    json.dump(
-      {
-        "video": args.video,
-        "duration": dur,
-        "search_start": search_start,
-        "search_end": search_end,
-        "transcript": transcript_path,
-        "picked": [c.__dict__ for c in picked],
-      },
-      f,
-      indent=2
-    )
+    # 3. Export
+    tasks = []
+    try:
+        w, h = args.target_res.lower().split("x")
+        res = (int(w), int(h))
+    except:
+        res = (1080, 1920)
 
-  if args.encoder == "cpu":
-    prefer_gpu = False
-  elif args.encoder == "nvenc":
-    prefer_gpu = True
-  else:
-    prefer_gpu = ffmpeg_supports_encoder("h264_nvenc")
+    for i, clip in enumerate(selected):
+        # Create descriptive filename
+        clip_start_time = format_timestamp(clip.start).replace(':', '_').replace(',', '_')
+        out_name = f"{args.output_prefix}_clip_{i + 1:02d}_{clip_start_time}.mp4"
+        out_path = os.path.join(args.outdir, out_name)
+        log_path = os.path.join(args.workdir, f"log_{args.output_prefix}_{i + 1}.txt")
 
-  jobs = max(1, int(args.jobs))
-  if prefer_gpu:
-    jobs = min(jobs, 3)
+        vf = build_filter_chain(clip, i + 1, args, res)
 
-  vf_fit = build_vf_chain(aspect=args.aspect, mode="fit", target_res=target_res)
-  vf_fill = build_vf_chain(aspect=args.aspect, mode="fill", target_res=target_res)
+        # Hardware Accel Check - Optimize for RTX 3060
+        v_codec = "libx264"
+        enc_opts = ["-preset", "fast", "-crf", "23"]
 
-  export_jobs = []  # type: List[Tuple[str, float, float, str, bool, bool, Optional[str], str]]
-  for i, c in enumerate(picked, start=1):
-    clip_name = f"clip_{i:02d}_{safe_basename_no_ext(args.video)}_{c.start:.2f}-{c.end:.2f}.mp4"
-    out_path = os.path.join(video_out_dir, clip_name)
+        # For RTX 3060, use NVENC with optimized settings
+        if args.encoder == "nvenc" or (args.encoder == "auto" and shutil.which("nvidia-smi")):
+            v_codec = "h264_nvenc"
+            # Use these optimized settings for RTX 3060
+            enc_opts = ["-preset", "p2", "-tune", "hq", "-cq", "23", "-b:v", "0"]
 
-    vf = None
-    if args.aspect == "source" and target_res is None:
-      vf = None
-    elif args.aspect == "source":
-      vf = build_vf_chain(aspect="source", mode="fit", target_res=target_res)
-    elif args.aspect_mode == "fit":
-      vf = vf_fit
-    elif args.aspect_mode == "fill":
-      vf = vf_fill
-    else:
-      vf = vf_fit
+        cmd = [
+            FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", str(clip.start), "-t", str(clip.end - clip.start),
+            "-i", args.video, "-vf", vf,
+            "-c:v", v_codec, *enc_opts,
+            "-c:a", "aac", "-b:a", "192k",
+            out_path
+        ]
+        tasks.append((cmd, log_path))
 
-    # Append overlay filters (text + bars) after aspect padding/cropping.
-    if _overlay_should_apply(aspect=args.aspect, mode=args.aspect_mode, overlay_mode=args.overlay):
-      if str(args.overlay_style) == "shorts":
-        overlay_vf = build_shorts_overlay_vf(
-          clip_index=i,
-          clip=c,
-          work_dir=args.workdir,
-          out_res=target_res,
-          top_text_tpl=str(args.overlay_top_text),
-          bottom_text_tpl=str(args.overlay_bottom_text),
-          font=str(args.overlay_font),
-          font_size=int(args.overlay_fontsize),
-          top_pad_pct=float(args.overlay_top_pad_pct),
-          bottom_pad_pct=float(args.overlay_bottom_pad_pct),
-          border_w=int(args.overlay_borderw),
-          border_color=str(args.overlay_bordercolor),
-          shadow_x=int(args.overlay_shadowx),
-          shadow_y=int(args.overlay_shadowy),
-        )
-      else:
-        overlay_vf = build_overlay_vf(
-          clip_index=i,
-          clip=c,
-          work_dir=args.workdir,
-          out_res=target_res,
-          bar_pct=float(args.overlay_bar_pct),
-          top_text_tpl=str(args.overlay_top_text),
-          bottom_text_tpl=str(args.overlay_bottom_text),
-          font=str(args.overlay_font),
-          font_size=int(args.overlay_fontsize),
-        )
-      vf = overlay_vf if not vf else f"{vf},{overlay_vf}"
+    # Parallel Export - Optimize for RTX 3060
+    # For video encoding, 2-3 parallel jobs is optimal for RTX 3060
+    max_w = min(args.jobs, 3, os.cpu_count() or 2)
+    print(f"Exporting with {max_w} workers (optimized for RTX 3060)...")
 
-    export_jobs.append((args.video, c.start, c.end, out_path, prefer_gpu, bool(args.hw_decode and prefer_gpu), vf, args.quality))
+    with ThreadPoolExecutor(max_workers=max_w) as exc:
+        futs = [exc.submit(run_ffmpeg, t) for t in tasks]
+        for i, f in enumerate(as_completed(futs)):
+            try:
+                f.result()
+                print(f"Clip {i + 1}/{len(tasks)} exported: {os.path.basename(tasks[i][0][-1])}")
+            except Exception as e:
+                print(f"Export failed for clip {i + 1}: {e}")
 
-  if jobs == 1 or len(export_jobs) <= 1:
-    for j in export_jobs:
-      _export_job(j)
-  else:
-    print(f"Exporting {len(export_jobs)} clips with {jobs} parallel workers...")
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=jobs) as ex:
-      futs = [ex.submit(_export_job, j) for j in export_jobs]
-      for fut in as_completed(futs):
-        _ = fut.result()
+    # Create a summary file with clip information
+    summary_path = os.path.join(args.outdir, f"{args.output_prefix}_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(f"Video: {video_basename}\n")
+        f.write(f"Processed: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Transcript: {os.path.basename(srt_file)}\n")
+        f.write(f"Model: {args.whisper_model}\n")
+        f.write(f"Language: {args.language}\n\n")
+        f.write("Clips:\n")
 
-  print(f"\nDone. Wrote {len(picked)} clips to: {args.outdir}")
-  print(f"Debug: {debug_path}")
-  print(f"Transcript used: {transcript_path}")
+        for i, clip in enumerate(selected):
+            hook, punchline = get_hook_punchline(clip.text)
+            f.write(f"Clip {i + 1}:\n")
+            f.write(f"  Time: {format_timestamp(clip.start)} - {format_timestamp(clip.end)}\n")
+            f.write(f"  Hook: {hook}\n")
+            f.write(f"  Punchline: {punchline}\n")
+            f.write(f"  Full text: {clip.text[:100]}{'...' if len(clip.text) > 100 else ''}\n\n")
+
+    print(f"Processing complete. Output saved to: {args.outdir}")
+    print(f"Summary file created: {summary_path}")
+
+    # Clean up any temporary text files that might have been created
+    for f in os.listdir(args.workdir):
+        if f.startswith("t_") and f.endswith(".txt") or f.startswith("b_") and f.endswith(".txt"):
+            try:
+                os.remove(os.path.join(args.workdir, f))
+            except:
+                pass
 
 
 if __name__ == "__main__":
-  main()
-
+    sys.stdout.reconfigure(encoding='utf-8')
+    main()

@@ -5,457 +5,404 @@ import queue
 import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import List
+import hashlib
+import re
+
+
+class ToolTip(object):
+    def __init__(self, widget, text='widget info'):
+        self.waittime = 500
+        self.wraplength = 180
+        self.widget = widget
+        self.text = text
+        self.widget.bind("<Enter>", self.enter)
+        self.widget.bind("<Leave>", self.leave)
+        self.widget.bind("<ButtonPress>", self.leave)
+        self.id = None
+        self.tw = None
+
+    def enter(self, event=None):
+        self.schedule()
+
+    def leave(self, event=None):
+        self.unschedule()
+        self.hidetip()
+
+    def schedule(self):
+        self.unschedule()
+        self.id = self.widget.after(self.waittime, self.showtip)
+
+    def unschedule(self):
+        id = self.id
+        self.id = None
+        if id: self.widget.after_cancel(id)
+
+    def showtip(self, event=None):
+        x, y, cx, cy = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 20
+        self.tw = tk.Toplevel(self.widget)
+        self.tw.wm_overrideredirect(True)
+        self.tw.wm_geometry("+%d+%d" % (x, y))
+        label = tk.Label(self.tw, text=self.text, justify='left',
+                         background="#ffffe0", relief='solid', borderwidth=1,
+                         wraplength=self.wraplength)
+        label.pack(ipadx=1)
+
+    def hidetip(self):
+        tw = self.tw
+        self.tw = None
+        if tw: tw.destroy()
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Important Clips Generator")
-        self.geometry("1000x780")
+        self.title("ClipGen Pro - GPU Whisper Edition")
+        self.geometry("1000x850")
+
+        style = ttk.Style()
+        style.theme_use('clam')
 
         self.proc = None
         self.log_q = queue.Queue()
         self.running = False
 
-        # --- Core Vars
+        self.init_vars()
+        self.build_ui()
+        self.poll_log()
+
+    def init_vars(self):
         self.video_path = tk.StringVar()
         self.transcript_path = tk.StringVar()
+        self.outdir = tk.StringVar(value=os.path.join(os.getcwd(), "output"))
+        self.workdir = tk.StringVar(value=os.path.join(os.getcwd(), "work"))
+
         self.num_clips = tk.IntVar(value=5)
         self.skip_intro = tk.DoubleVar(value=0.0)
-        self.skip_outro = tk.DoubleVar(value=0.0)
-        self.len_preset = tk.StringVar(value="60-90")
-        self.language = tk.StringVar(value="auto")
-        self.scene_thresh = tk.DoubleVar(value=0.35)
-        self.silence_db = tk.DoubleVar(value=-35.0)
-        self.min_silence = tk.DoubleVar(value=0.6)
-        self.outdir = tk.StringVar(value=os.path.abspath("out_clips"))
-        self.workdir = tk.StringVar(value=os.path.abspath("work"))
 
-        # Performance
-        self.jobs = tk.IntVar(value=max(1, min(4, (os.cpu_count() or 4))))
-        self.encoder = tk.StringVar(value="auto")  # auto/cpu/nvenc
-        self.hw_decode = tk.BooleanVar(value=False)
-        self.quality = tk.StringVar(value="high")  # high/fast
-
-        # Engagement / aspect
-        self.engagement = tk.StringVar(value="balanced")  # balanced/action/dialogue
-        self.aspect = tk.StringVar(value="source")        # source/16:9/9:16/1:1/4:5/21:9
-        self.aspect_mode = tk.StringVar(value="smart")    # smart/fit/fill
-        self.target_res = tk.StringVar(value="")          # e.g. 1080x1920
-
-        # ASR
-        self.asr_backend = tk.StringVar(value="auto")      # auto/whispercpp/faster-whisper
-        self.asr_model = tk.StringVar(value="small")       # tiny/base/small/...
-        self.asr_device = tk.StringVar(value="auto")       # auto/cpu/cuda
-        self.asr_compute_type = tk.StringVar(value="auto") # auto/float16/int8/...
-        self.asr_threads = tk.IntVar(value=6)
-
-        # Overlays
-        self.overlay = tk.StringVar(value="auto")
-        self.overlay_style = tk.StringVar(value="bars")
-
-        self._build_ui()
-        self.after(100, self._drain_log_queue)
-
-    def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
-
-        # --------------------
-        # Paths
-        # --------------------
-        frm = ttk.Frame(self)
-        frm.pack(fill="x", **pad)
-
-        r = 0
-        ttk.Label(frm, text="Video:").grid(row=r, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.video_path, width=80).grid(row=r, column=1, sticky="we")
-        ttk.Button(frm, text="Browse", command=self._pick_video).grid(row=r, column=2, sticky="e")
-
-        r += 1
-        ttk.Label(frm, text="Transcript (optional SRT):").grid(row=r, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.transcript_path, width=80).grid(row=r, column=1, sticky="we")
-        ttk.Button(frm, text="Browse", command=self._pick_transcript).grid(row=r, column=2, sticky="e")
-
-        r += 1
-        ttk.Label(frm, text="Output dir:").grid(row=r, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.outdir, width=80).grid(row=r, column=1, sticky="we")
-        ttk.Button(frm, text="Browse", command=self._pick_outdir).grid(row=r, column=2, sticky="e")
-
-        r += 1
-        ttk.Label(frm, text="Work dir (audio/transcripts):").grid(row=r, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.workdir, width=80).grid(row=r, column=1, sticky="we")
-        ttk.Button(frm, text="Browse", command=self._pick_workdir).grid(row=r, column=2, sticky="e")
-
-        frm.columnconfigure(1, weight=1)
-
-        # --------------------
-        # Clip & scoring options
-        # --------------------
-        opts = ttk.LabelFrame(self, text="Clip & Scoring Options")
-        opts.pack(fill="x", **pad)
-
-        r = 0
-        ttk.Label(opts, text="# clips:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Spinbox(opts, from_=1, to=50, textvariable=self.num_clips, width=7).grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(opts, text="Len preset:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Combobox(
-            opts,
-            textvariable=self.len_preset,
-            values=["60-90", "60-120"],
-            width=10,
-            state="readonly"
-        ).grid(row=r, column=3, sticky="w", **pad)
-
-        ttk.Label(opts, text="Language:").grid(row=r, column=4, sticky="w", **pad)
-        ttk.Combobox(
-            opts,
-            textvariable=self.language,
-            values=["auto", "en", "ja"],
-            width=8,
-            state="readonly"
-        ).grid(row=r, column=5, sticky="w", **pad)
-
-        r += 1
-        ttk.Label(opts, text="Skip intro (sec):").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Spinbox(opts, from_=0, to=99999, increment=10, textvariable=self.skip_intro, width=10).grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(opts, text="Skip outro (sec):").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Spinbox(opts, from_=0, to=99999, increment=10, textvariable=self.skip_outro, width=10).grid(row=r, column=3, sticky="w", **pad)
-
-        r += 1
-        ttk.Label(opts, text="Scene thresh:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Spinbox(opts, from_=0.05, to=0.95, increment=0.05, textvariable=self.scene_thresh, width=10).grid(
-            row=r, column=1, sticky="w", **pad
-        )
-
-        ttk.Label(opts, text="Silence dB:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Spinbox(opts, from_=-80, to=-5, increment=1, textvariable=self.silence_db, width=10).grid(
-            row=r, column=3, sticky="w", **pad
-        )
-
-        ttk.Label(opts, text="Min silence (sec):").grid(row=r, column=4, sticky="w", **pad)
-        ttk.Spinbox(opts, from_=0.1, to=5.0, increment=0.1, textvariable=self.min_silence, width=10).grid(
-            row=r, column=5, sticky="w", **pad
-        )
-
-        r += 1
-        ttk.Label(opts, text="Engagement mode:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Combobox(
-            opts,
-            textvariable=self.engagement,
-            values=["balanced", "action", "dialogue"],
-            width=12,
-            state="readonly"
-        ).grid(row=r, column=1, sticky="w", **pad)
-
-        # --------------------
-        # Aspect & quality
-        # --------------------
-        aspect_frame = ttk.LabelFrame(self, text="Aspect & Quality")
-        aspect_frame.pack(fill="x", **pad)
-
-        r = 0
-        ttk.Label(aspect_frame, text="Aspect:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Combobox(
-            aspect_frame,
-            textvariable=self.aspect,
-            values=["source", "16:9", "9:16", "1:1", "4:5", "21:9"],
-            width=8,
-            state="readonly"
-        ).grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(aspect_frame, text="Aspect mode:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Combobox(
-            aspect_frame,
-            textvariable=self.aspect_mode,
-            values=["smart", "fit", "fill"],
-            width=8,
-            state="readonly"
-        ).grid(row=r, column=3, sticky="w", **pad)
-
-        ttk.Label(aspect_frame, text="Target res (WxH):").grid(row=r, column=4, sticky="w", **pad)
-        ttk.Entry(aspect_frame, textvariable=self.target_res, width=12).grid(row=r, column=5, sticky="w", **pad)
-
-        r += 1
-        ttk.Label(aspect_frame, text="Quality:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Combobox(
-            aspect_frame,
-            textvariable=self.quality,
-            values=["high", "fast"],
-            width=8,
-            state="readonly"
-        ).grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(aspect_frame, text="Overlay:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Combobox(
-            aspect_frame,
-            textvariable=self.overlay,
-            values=["off", "auto", "on"],
-            width=8,
-            state="readonly"
-        ).grid(row=r, column=3, sticky="w", **pad)
-
-        ttk.Label(aspect_frame, text="Overlay style:").grid(row=r, column=4, sticky="w", **pad)
-        ttk.Combobox(
-            aspect_frame,
-            textvariable=self.overlay_style,
-            values=["bars", "shorts"],
-            width=10,
-            state="readonly"
-        ).grid(row=r, column=5, sticky="w", **pad)
-
-        # --------------------
-        # ASR Settings
-        # --------------------
-        asr_frame = ttk.LabelFrame(self, text="Transcription (ASR)")
-        asr_frame.pack(fill="x", **pad)
-
-        r = 0
-        ttk.Label(asr_frame, text="Backend:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Combobox(
-            asr_frame,
-            textvariable=self.asr_backend,
-            values=["auto", "whispercpp", "faster-whisper"],
-            width=14,
-            state="readonly",
-        ).grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(asr_frame, text="Model:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Entry(asr_frame, textvariable=self.asr_model, width=12).grid(row=r, column=3, sticky="w", **pad)
-
-        r += 1
-        ttk.Label(asr_frame, text="Device:").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Combobox(
-            asr_frame,
-            textvariable=self.asr_device,
-            values=["auto", "cpu", "cuda"],
-            width=10,
-            state="readonly",
-        ).grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(asr_frame, text="Compute type:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Entry(asr_frame, textvariable=self.asr_compute_type, width=12).grid(row=r, column=3, sticky="w", **pad)
-
-        ttk.Label(asr_frame, text="Threads (whisper.cpp):").grid(row=r, column=4, sticky="w", **pad)
-        ttk.Spinbox(asr_frame, from_=1, to=32, textvariable=self.asr_threads, width=6).grid(row=r, column=5, sticky="w", **pad)
-
-        # --------------------
-        # Performance
-        # --------------------
-        perf = ttk.LabelFrame(self, text="Performance")
-        perf.pack(fill="x", **pad)
-
-        r = 0
-        ttk.Label(perf, text="Parallel exports (jobs):").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Spinbox(perf, from_=1, to=16, textvariable=self.jobs, width=10).grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(perf, text="Encoder:").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Combobox(
-            perf,
-            textvariable=self.encoder,
-            values=["auto", "cpu", "nvenc"],
-            width=10,
-            state="readonly"
-        ).grid(row=r, column=3, sticky="w", **pad)
-
-        ttk.Checkbutton(perf, text="Try HW decode (CUDA)", variable=self.hw_decode).grid(row=r, column=4, sticky="w", **pad)
-
-        # --------------------
-        # Buttons + progress
-        # --------------------
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", **pad)
-
-        self.run_btn = ttk.Button(btns, text="Run", command=self.on_run)
-        self.run_btn.pack(side="left")
-
-        self.stop_btn = ttk.Button(btns, text="Stop", command=self.on_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=8)
-
-        self.prog = ttk.Progressbar(btns, mode="indeterminate")
-        self.prog.pack(side="left", fill="x", expand=True, padx=10)
-
-        # --------------------
-        # Log console
-        # --------------------
-        logfrm = ttk.LabelFrame(self, text="Log")
-        logfrm.pack(fill="both", expand=True, **pad)
-
-        self.log = tk.Text(logfrm, height=20, wrap="word")
-        self.log.pack(side="left", fill="both", expand=True)
-
-        scroll = ttk.Scrollbar(logfrm, command=self.log.yview)
-        scroll.pack(side="right", fill="y")
-        self.log.configure(yscrollcommand=scroll.set)
-
-        note = ttk.Label(
-            self,
-            text="Tip: First run may take longer to transcribe; subsequent runs reuse cached WAV/SRT when possible.",
-        )
-        note.pack(anchor="w", padx=12, pady=2)
-
-    # --- Pickers
-    def _pick_video(self):
-        p = filedialog.askopenfilename(
-            title="Select Video",
-            filetypes=[("Video files", "*.mp4 *.mkv *.mov *.webm *.avi"), ("All files", "*.*")],
-        )
-        if p:
-            self.video_path.set(p)
-
-    def _pick_transcript(self):
-        p = filedialog.askopenfilename(
-            title="Select Transcript (SRT)",
-            filetypes=[("SRT files", "*.srt"), ("All files", "*.*")],
-        )
-        if p:
-            self.transcript_path.set(p)
-
-    def _pick_outdir(self):
-        p = filedialog.askdirectory(title="Select Output Folder")
-        if p:
-            self.outdir.set(p)
-
-    def _pick_workdir(self):
-        p = filedialog.askdirectory(title="Select Work Folder")
-        if p:
-            self.workdir.set(p)
-
-    # --- Logging
-    def _append_log(self, s: str):
-        self.log.insert("end", s)
-        self.log.see("end")
-
-    def _drain_log_queue(self):
-        try:
-            while True:
-                msg = self.log_q.get_nowait()
-                self._append_log(msg)
-        except queue.Empty:
-            pass
-        self.after(100, self._drain_log_queue)
-
-    # --- Run/Stop
-    def on_run(self):
-        if self.running:
-            return
-
-        engine = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_important_clips.py")
-        if not os.path.exists(engine):
-            messagebox.showerror("Missing file", f"Could not find:\n{engine}\n\nPut this UI file next to auto_important_clips.py")
-            return
-
-        video = self.video_path.get().strip()
-        if not video or not os.path.exists(video):
-            messagebox.showerror("Invalid input", "Please select a valid video file.")
-            return
-
-        outdir = self.outdir.get().strip()
-        workdir = self.workdir.get().strip()
-        os.makedirs(outdir, exist_ok=True)
-        os.makedirs(workdir, exist_ok=True)
-
-        # Basic and advanced arguments
-        cmd = [sys.executable, os.path.abspath("auto_important_clips.py")]
-        cmd += ["--video", video]
-        cmd += ["--num-clips", str(int(self.num_clips.get()))]
-        cmd += ["--skip-intro-sec", str(float(self.skip_intro.get()))]
-        cmd += ["--skip-outro-sec", str(float(self.skip_outro.get()))]
-        cmd += ["--len-preset", self.len_preset.get()]
-        cmd += ["--outdir", outdir]
-        cmd += ["--workdir", workdir]
-        cmd += ["--language", self.language.get()]
-        cmd += ["--scene-thresh", str(float(self.scene_thresh.get()))]
-        cmd += ["--silence-db", str(float(self.silence_db.get()))]
-        cmd += ["--min-silence-sec", str(float(self.min_silence.get()))]
-        cmd += ["--jobs", str(int(self.jobs.get()))]
-        cmd += ["--encoder", self.encoder.get()]
-        cmd += ["--quality", self.quality.get()]
-        cmd += ["--engagement", self.engagement.get()]
-
-        # Aspect/quality
-        cmd += ["--aspect", self.aspect.get(), "--aspect-mode", self.aspect_mode.get()]
-        if self.target_res.get().strip():
-            cmd += ["--target-res", self.target_res.get().strip()]
-        cmd += ["--quality", self.quality.get()]
+        # Whisper Vars
+        self.whisper_model = tk.StringVar(value="medium")
+        self.whisper_lang = tk.StringVar(value="auto")
 
         # Overlay
-        cmd += ["--overlay", self.overlay.get(), "--overlay-style", self.overlay_style.get()]
+        self.template_style = tk.StringVar(value="viral_shorts")
+        self.channel_name = tk.StringVar(value="@MyChannel")
+        self.top_text = tk.StringVar(value="{hook}")
+        self.bot_text = tk.StringVar(value="{punchline}")
+        self.font_path = tk.StringVar()
 
-        # ASR settings
-        cmd += ["--asr-backend", self.asr_backend.get()]
-        cmd += ["--asr-model", self.asr_model.get()]
-        cmd += ["--asr-device", self.asr_device.get()]
-        cmd += ["--asr-compute-type", self.asr_compute_type.get()]
-        cmd += ["--asr-threads", str(int(self.asr_threads.get()))]
+        # Export
+        self.resolution = tk.StringVar(value="1080x1920")
+        self.aspect_mode = tk.StringVar(value="fit")
+        self.jobs = tk.IntVar(value=min(4, os.cpu_count() or 2))
 
-        if bool(self.hw_decode.get()):
-            cmd += ["--hw-decode"]
+        self.progress_var = tk.DoubleVar(value=0.0)
 
-        tr = self.transcript_path.get().strip()
-        if tr:
-            if not os.path.exists(tr):
-                messagebox.showerror("Invalid input", "Transcript path does not exist.")
+        # Auto-detect transcript option
+        self.auto_detect_transcript = tk.BooleanVar(value=True)
+
+    def build_ui(self):
+        main = ttk.Frame(self, padding="10")
+        main.pack(fill="both", expand=True)
+
+        nb = ttk.Notebook(main)
+        nb.pack(fill="both", expand=True)
+
+        self.tab_input = ttk.Frame(nb)
+        self.tab_overlay = ttk.Frame(nb)
+        self.tab_export = ttk.Frame(nb)
+
+        nb.add(self.tab_input, text="📁 Input & Transcription")
+        nb.add(self.tab_overlay, text="🎨 Design")
+        nb.add(self.tab_export, text="⚙️ Export")
+
+        self._build_input_tab()
+        self._build_overlay_tab()
+        self._build_export_tab()
+        self._build_footer(main)
+
+    def _build_input_tab(self):
+        # File Source
+        f = ttk.LabelFrame(self.tab_input, text="Source Files", padding=10)
+        f.pack(fill="x", padx=10, pady=10)
+
+        grid_opts = {'sticky': 'ew', 'padx': 5, 'pady': 5}
+
+        ttk.Label(f, text="Video File:").grid(row=0, column=0, **grid_opts)
+        video_entry = ttk.Entry(f, textvariable=self.video_path)
+        video_entry.grid(row=0, column=1, **grid_opts)
+        video_entry.bind("<FocusOut>", self.check_for_existing_transcript)
+        ttk.Button(f, text="Browse", command=lambda: self._browse_file(self.video_path, "Video")).grid(row=0, column=2,
+                                                                                                       **grid_opts)
+
+        ttk.Label(f, text="SRT (Optional):").grid(row=1, column=0, **grid_opts)
+        ttk.Entry(f, textvariable=self.transcript_path).grid(row=1, column=1, **grid_opts)
+        ttk.Button(f, text="Browse", command=lambda: self._browse_file(self.transcript_path, "SRT")).grid(row=1,
+                                                                                                          column=2,
+                                                                                                          **grid_opts)
+
+        # Auto-detect transcript checkbox
+        ttk.Checkbutton(f, text="Auto-detect existing transcript", variable=self.auto_detect_transcript).grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+
+        f.columnconfigure(1, weight=1)
+
+        # Transcription Settings
+        f_trans = ttk.LabelFrame(self.tab_input, text="Auto-Transcription (GPU)", padding=10)
+        f_trans.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(f_trans, text="Model Size:").grid(row=0, column=0, **grid_opts)
+        ttk.Combobox(f_trans, textvariable=self.whisper_model, values=["small", "medium", "large"]).grid(row=0,
+                                                                                                         column=1,
+                                                                                                         **grid_opts)
+
+        ttk.Label(f_trans, text="Language:").grid(row=0, column=2, **grid_opts)
+        ttk.Combobox(f_trans, textvariable=self.whisper_lang, values=["auto", "english", "japanese"]).grid(row=0,
+                                                                                                           column=3,
+                                                                                                           **grid_opts)
+
+        lbl_info = ttk.Label(f_trans,
+                             text="ℹ️ If SRT is not provided, this will run automatically. Uses GPU if available.",
+                             foreground="gray")
+        lbl_info.grid(row=1, column=0, columnspan=4, sticky="w", padx=5)
+
+        # Clipping Logic
+        f2 = ttk.LabelFrame(self.tab_input, text="Clipping Logic", padding=10)
+        f2.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(f2, text="Clip Count:").grid(row=0, column=0, **grid_opts)
+        ttk.Spinbox(f2, from_=1, to=50, textvariable=self.num_clips, width=5).grid(row=0, column=1, sticky="w", padx=5,
+                                                                                   pady=5)
+
+        ttk.Label(f2, text="Skip Intro (s):").grid(row=0, column=2, **grid_opts)
+        ttk.Entry(f2, textvariable=self.skip_intro, width=8).grid(row=0, column=3, sticky="w", padx=5, pady=5)
+
+    def _build_overlay_tab(self):
+        f = ttk.LabelFrame(self.tab_overlay, text="Style", padding=10)
+        f.pack(fill="x", padx=10, pady=10)
+
+        grid_opts = {'sticky': 'ew', 'padx': 5, 'pady': 5}
+
+        ttk.Label(f, text="Template:").grid(row=0, column=0, **grid_opts)
+        cb = ttk.Combobox(f, textvariable=self.template_style,
+                          values=["viral_shorts", "neon_vibes", "glass_modern", "cinematic", "simple"])
+        cb.grid(row=0, column=1, **grid_opts)
+
+        ttk.Label(f, text="Channel Name:").grid(row=1, column=0, **grid_opts)
+        ttk.Entry(f, textvariable=self.channel_name).grid(row=1, column=1, **grid_opts)
+
+        ttk.Label(f, text="Custom Font:").grid(row=2, column=0, **grid_opts)
+        ttk.Entry(f, textvariable=self.font_path).grid(row=2, column=1, **grid_opts)
+        ttk.Button(f, text="Find...", command=lambda: self._browse_file(self.font_path, "Font")).grid(row=2, column=2,
+                                                                                                      **grid_opts)
+
+        f.columnconfigure(1, weight=1)
+
+    def _build_export_tab(self):
+        f = ttk.LabelFrame(self.tab_export, text="Output Settings", padding=10)
+        f.pack(fill="x", padx=10, pady=10)
+
+        grid_opts = {'sticky': 'ew', 'padx': 5, 'pady': 5}
+
+        ttk.Label(f, text="Output Dir:").grid(row=0, column=0, **grid_opts)
+        ttk.Entry(f, textvariable=self.outdir).grid(row=0, column=1, **grid_opts)
+        ttk.Button(f, text="Browse", command=lambda: self._browse_dir(self.outdir)).grid(row=0, column=2, **grid_opts)
+
+        ttk.Label(f, text="Resolution:").grid(row=1, column=0, **grid_opts)
+        ttk.Combobox(f, textvariable=self.resolution, values=["1080x1920", "1920x1080", "1080x1080"]).grid(row=1,
+                                                                                                           column=1,
+                                                                                                           **grid_opts)
+
+        ttk.Label(f, text="Workers:").grid(row=2, column=0, **grid_opts)
+        ttk.Scale(f, variable=self.jobs, from_=1, to=16, orient="horizontal").grid(row=2, column=1, **grid_opts)
+
+        f.columnconfigure(1, weight=1)
+
+    def _build_footer(self, parent):
+        f = ttk.Frame(parent, padding=10)
+        f.pack(fill="x", side="bottom")
+
+        self.pbar = ttk.Progressbar(f, variable=self.progress_var, maximum=100)
+        self.pbar.pack(fill="x", pady=5)
+
+        self.btn_run = ttk.Button(f, text="START PROCESSING", command=self.run_process)
+        self.btn_run.pack(side="right", padx=5)
+
+        self.log_widget = tk.Text(parent, height=12, bg="#202020", fg="#eeeeee", font=("Consolas", 9))
+        self.log_widget.pack(fill="both", expand=True, padx=10)
+
+    def _browse_file(self, var, type_name):
+        types = [("All Files", "*.*")]
+        if type_name == "Video":
+            types = [("Video", "*.mp4 *.mkv *.mov")]
+        elif type_name == "Font":
+            types = [("Font", "*.ttf *.otf")]
+        elif type_name == "SRT":
+            types = [("Subtitle", "*.srt")]
+        path = filedialog.askopenfilename(filetypes=types)
+        if path:
+            var.set(path)
+            if type_name == "Video" and self.auto_detect_transcript.get():
+                self.check_for_existing_transcript()
+
+    def _browse_dir(self, var):
+        path = filedialog.askdirectory()
+        if path: var.set(path)
+
+    def log(self, msg):
+        self.log_widget.insert("end", str(msg) + "\n")
+        self.log_widget.see("end")
+
+    def poll_log(self):
+        while not self.log_q.empty():
+            msg = self.log_q.get_nowait()
+            self.log(msg)
+            if "Clip exported" in str(msg):
+                self.progress_var.set(self.progress_var.get() + (100 / self.num_clips.get()))
+        self.after(100, self.poll_log)
+
+    def get_video_filename(self):
+        """Extract the filename without extension from the video path"""
+        if not self.video_path.get():
+            return None
+
+        basename = os.path.basename(self.video_path.get())
+        filename = os.path.splitext(basename)[0]
+        # Clean the filename to make it suitable for folder names
+        return re.sub(r'[^\w\-_\. ]', '_', filename)
+
+    def get_video_hash(self):
+        """Generate a unique hash for the video file to identify it"""
+        if not self.video_path.get() or not os.path.exists(self.video_path.get()):
+            return None
+
+        # Use file size and name as a simple hash
+        file_size = os.path.getsize(self.video_path.get())
+        basename = os.path.basename(self.video_path.get())
+        hash_input = f"{basename}_{file_size}"
+        return hashlib.md5(hash_input.encode()).hexdigest()[:10]
+
+    def check_for_existing_transcript(self, event=None):
+        """Check if a transcript already exists for this video"""
+        if not self.auto_detect_transcript.get() or not self.video_path.get():
+            return
+
+        video_filename = self.get_video_filename()
+        if not video_filename:
+            return
+
+        # Check in the output directory for a transcript
+        video_output_dir = os.path.join(self.outdir.get(), video_filename)
+
+        # Check for SRT files in the video's output directory
+        if os.path.exists(video_output_dir):
+            for file in os.listdir(video_output_dir):
+                if file.endswith(".srt"):
+                    srt_path = os.path.join(video_output_dir, file)
+                    self.transcript_path.set(srt_path)
+                    self.log(f"Found existing transcript: {srt_path}")
+                    return
+
+        # Also check in the workdir
+        video_hash = self.get_video_hash()
+        if video_hash:
+            work_transcript = os.path.join(self.workdir.get(), f"{video_hash}.srt")
+            if os.path.exists(work_transcript):
+                self.transcript_path.set(work_transcript)
+                self.log(f"Found existing transcript: {work_transcript}")
                 return
-            cmd += ["--transcript", tr]
 
-        self.log.delete("1.0", "end")
-        self._append_log("Launching:\n" + " ".join(shlex_quote(a) for a in cmd) + "\n\n")
+        # Clear transcript path if none found
+        self.transcript_path.set("")
+        self.log("No existing transcript found. Will generate new one.")
+
+    def run_process(self):
+        if not self.video_path.get():
+            messagebox.showerror("Error", "Select a video file first!")
+            return
 
         self.running = True
-        self.run_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.prog.start(10)
+        self.btn_run.config(state="disabled")
+        self.progress_var.set(0)
+        self.log("Starting Process...")
 
-        t = threading.Thread(target=self._worker_run, args=(cmd,), daemon=True)
-        t.start()
+        threading.Thread(target=self._worker, daemon=True).start()
 
-    def _worker_run(self, cmd: List[str]):
+    def _worker(self):
+        video_filename = self.get_video_filename()
+        video_hash = self.get_video_hash()
+
+        # Create video-specific output directory
+        video_output_dir = os.path.join(self.outdir.get(), video_filename)
+        os.makedirs(video_output_dir, exist_ok=True)
+
+        # Create work directory if it doesn't exist
+        os.makedirs(self.workdir.get(), exist_ok=True)
+
+        # Determine transcript path
+        transcript_path = self.transcript_path.get()
+        if not transcript_path:
+            # If no transcript provided, set the path where it should be generated
+            transcript_path = os.path.join(video_output_dir, f"{video_filename}_transcript.srt")
+
+        cmd = [
+            sys.executable, "auto_important_clips.py",
+            "--video", self.video_path.get(),
+            "--outdir", video_output_dir,  # Use video-specific output directory
+            "--workdir", self.workdir.get(),
+            "--num-clips", str(self.num_clips.get()),
+            "--template-style", self.template_style.get(),
+            "--target-res", self.resolution.get(),
+            "--jobs", str(self.jobs.get()),
+            "--overlay-top-text", self.top_text.get(),
+            "--overlay-bottom-text", self.bot_text.get(),
+            "--whisper-model", self.whisper_model.get(),
+            "--language", self.whisper_lang.get(),
+            "--output-prefix", video_filename,  # Use video filename as prefix for output files
+            "--transcript-output", transcript_path  # Specify where to save the transcript
+        ]
+
+        if self.transcript_path.get():
+            cmd.extend(["--transcript", self.transcript_path.get()])
+
+        if self.font_path.get():
+            cmd.extend(["--overlay-font", self.font_path.get()])
+
+        if self.channel_name.get():
+            cmd.extend(["--channel-name", self.channel_name.get()])
+
+        if self.skip_intro.get() > 0:
+            cmd.extend(["--skip-intro", str(self.skip_intro.get())])
+
         try:
-            self.proc = subprocess.Popen(
+            self.log(f"Output directory: {video_output_dir}")
+            self.log(f"Transcript will be saved to: {transcript_path}")
+
+            process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,
-                universal_newlines=True,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                encoding="utf-8",
+                errors="replace"
             )
-            assert self.proc.stdout is not None
-            for line in self.proc.stdout:
-                self.log_q.put(line)
-            rc = self.proc.wait()
-            self.log_q.put(f"\nProcess exited with code: {rc}\n")
+
+            for line in process.stdout:
+                self.log_q.put(line.strip())
+
+            process.wait()
+            self.log_q.put("Process Completed.")
+
+            # Update transcript path if it was generated
+            if os.path.exists(transcript_path):
+                self.transcript_path.set(transcript_path)
+
         except Exception as e:
-            self.log_q.put(f"\nERROR: {e}\n")
+            self.log_q.put(f"ERROR: {e}")
         finally:
-            self.proc = None
+            self.btn_run.config(state="normal")
             self.running = False
-            self.after(0, self._on_done_ui)
-
-    def _on_done_ui(self):
-        self.prog.stop()
-        self.run_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-
-    def on_stop(self):
-        if not self.proc:
-            return
-        try:
-            self.log_q.put("\nStopping...\n")
-            self.proc.terminate()
-        except Exception as e:
-            self.log_q.put(f"\nFailed to stop: {e}\n")
-
-
-def shlex_quote(s: str) -> str:
-    if not s:
-        return '""'
-    if any(c.isspace() for c in s) or any(c in s for c in ['"', "'"]):
-        return '"' + s.replace('"', '\\"') + '"'
-    return s
 
 
 if __name__ == "__main__":
